@@ -5,6 +5,8 @@ Everything that changes state goes through the repository (guards, ledger, audit
 from __future__ import annotations
 
 import contextlib
+import threading
+import time
 import uuid
 from dataclasses import dataclass, field
 
@@ -27,6 +29,10 @@ from airos.errors import (
 from airos.persistence.interfaces import RecoveryReport
 from airos.persistence.sqlite_repo import SYSTEM, SqliteRepository
 from airos.verifier import verify_response
+
+
+class AdapterTimeout(AirosError):
+    """The adapter did not return within the contract's wall-clock limit."""
 
 
 @dataclass
@@ -86,6 +92,7 @@ class Worker:
     def tick(self) -> TickReport:
         rep = TickReport()
         self.sweep_timeouts()
+        self.repo.time_out_expired_runs()  # hard per-run limit, independent of any adapter or worker
         for t in self.repo.list_tasks(TaskState.APPROVED):
             try:
                 out = self.repo.queue_task(t.task_id, t.version)
@@ -126,6 +133,39 @@ class Worker:
                     pass  # children still in flight
         return rep
 
+    heartbeat_interval_s = 15.0
+
+    def _join(self, thread: threading.Thread, timeout_s: float, run_id: str) -> None:
+        """Wait up to timeout_s (real time) for the adapter thread, heartbeating the lease while it works.
+        Seam for tests, which must not sleep. Returns early if the lease is lost (recovery then owns the run)."""
+        end = time.monotonic() + timeout_s
+        while thread.is_alive():
+            remaining = end - time.monotonic()
+            if remaining <= 0:
+                return
+            thread.join(min(remaining, self.heartbeat_interval_s))
+            if thread.is_alive() and not self.repo.heartbeat(run_id, self.worker_id):
+                return
+
+    def _call_adapter(self, adapter, request, workdir, timeout_s: int):  # type: ignore[no-untyped-def]
+        """Run the adapter in a daemon thread so a hung adapter cannot hang the worker past the wall-clock limit."""
+        box: dict[str, object] = {}
+
+        def target() -> None:
+            try:
+                box["response"] = adapter.execute(request, workdir)
+            except BaseException as exc:  # noqa: BLE001
+                box["error"] = exc
+
+        th = threading.Thread(target=target, daemon=True, name=f"adapter-{request.run_id[:8]}")
+        th.start()
+        self._join(th, timeout_s, request.run_id)
+        if th.is_alive():
+            raise AdapterTimeout(f"adapter still running after {timeout_s}s")
+        if "error" in box:
+            raise box["error"]  # type: ignore[misc]
+        return box["response"]
+
     def _fail(self, run_id: str, *, retryable: bool, error_class: str, detail: str, usage: ResourceUsage | None = None) -> None:
         err = ErrorRecord(ts_ms=self.repo.clock.now_ms(), attempt=0, error_class=error_class,
                           retryable=retryable, detail=detail)
@@ -139,9 +179,18 @@ class Worker:
         if not self.repo.heartbeat(run_id, self.worker_id):
             return
         try:
-            response = adapter.execute(request, workdir)
+            response = self._call_adapter(adapter, request, workdir, task.contract.resource_limits.wall_clock_s)
+        except AdapterTimeout:
+            # Hard limit enforced by the control plane: the adapter cannot extend, ignore or outlive it.
+            with contextlib.suppress(GuardFailed, LeaseLost):
+                self.repo.time_out_run(run_id)
+            return
         except Exception as exc:  # adapter crash: transient, retried within limits
             self._fail(run_id, retryable=True, error_class="adapter_error", detail=f"adapter raised {type(exc).__name__}: {exc}")
+            return
+        if self.repo.run_deadline_passed(run_id):  # late result: discard BEFORE anything is stored
+            with contextlib.suppress(GuardFailed, LeaseLost):
+                self.repo.time_out_run(run_id)
             return
         usage = response.resource_usage
         if response.status != "succeeded":

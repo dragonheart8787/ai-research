@@ -355,7 +355,7 @@ class SqliteRepository:
             blocked_from=TaskState(r["blocked_from"]) if r["blocked_from"] else None,
             contract=TaskContract.model_validate_json(r["contract_json"]), contract_sha256=r["contract_sha256"],
             side_effect_class=SideEffectClass(r["side_effect_class"]), attempt_count=r["attempt_count"],
-            review_cycles=r["review_cycles"], not_before_ms=r["not_before_ms"],
+            review_cycles=r["review_cycles"], timeout_retries=r["timeout_retries"], not_before_ms=r["not_before_ms"],
             error_history=[ErrorRecord.model_validate(e) for e in json.loads(r["error_history_json"])],
             created_by=r["created_by"], created_at_ms=r["created_at_ms"], updated_at_ms=r["updated_at_ms"],
             state_entered_at_ms=r["state_entered_at_ms"],
@@ -860,6 +860,8 @@ class SqliteRepository:
             task = self._load_task(conn, r["task_id"])
             if task.state is not TaskState.RUNNING:
                 raise LeaseLost(f"task {task.task_id} is no longer running")
+            if now >= self._run_deadline_ms(r, task):  # the hard limit is the control plane's, not the adapter's
+                return self._time_out_run_row(conn, task, r)  # a result delivered at/after the deadline is discarded
             if outcome is RunState.SUCCEEDED:  # settles inside _apply
                 return self._apply(conn, task, Event.FINISH, SYSTEM, GuardContext(verifier_passed=verifier_passed),
                                    reason="run succeeded", error=error, run_end=RunState.SUCCEEDED, usage=usage)
@@ -867,14 +869,80 @@ class SqliteRepository:
             self._close_reservation(conn, task, task.attempt_count, run_id=run_id, settle=True, usage=usage)
             ctx = GuardContext(error_retryable=retryable)
             end = RunState.TIMED_OUT if outcome is RunState.TIMED_OUT else RunState.FAILED
-            if run_guard("retry_allowed", self._guard_input(conn, task, SYSTEM, ctx)) is None:
+            timeout_ok = outcome is not RunState.TIMED_OUT or task.timeout_retries < self.limits.max_timeout_retries
+            if timeout_ok and run_guard("retry_allowed", self._guard_input(conn, task, SYSTEM, ctx)) is None:
                 res = self._reserve(conn, task)
                 if res.ok:
-                    return self._apply(conn, task, Event.RETRY, SYSTEM, ctx, reason="retryable failure", error=error, run_end=end)
+                    out = self._apply(conn, task, Event.RETRY, SYSTEM, ctx, reason="retryable failure", error=error, run_end=end)
+                    if outcome is RunState.TIMED_OUT:
+                        conn.execute("UPDATE tasks SET timeout_retries=timeout_retries+1 WHERE task_id=?", (task.task_id,))
+                        out = self._load_task(conn, task.task_id)
+                    return out
                 return self._apply(conn, task, Event.BLOCK, SYSTEM, GuardContext(block_reason=BlockReason.BUDGET_INSUFFICIENT),
                                    reason=f"retry blocked: {res.reason}", error=error, run_end=end)
             ev = Event.TIMEOUT if outcome is RunState.TIMED_OUT else Event.FAIL
             return self._apply(conn, task, ev, SYSTEM, ctx, reason="non-retryable failure", error=error, run_end=end)
+    # ------------------------------------------------------------ wall-clock timeouts (enforced here, never by the adapter)
+
+    @staticmethod
+    def _run_deadline_ms(run_row: sqlite3.Row, task: TaskRecord) -> int:
+        return int(run_row["started_at_ms"]) + task.contract.resource_limits.wall_clock_s * 1000
+
+    def _time_out_run_row(self, conn: sqlite3.Connection, task: TaskRecord, run_row: sqlite3.Row) -> TaskRecord:
+        """The run ends as timed_out; the reservation settles at WORST CASE; normal retry rules apply, but at most
+        `max_timeout_retries` timeouts are ever retried."""
+        now = self.clock.now_ms()
+        limit_s = task.contract.resource_limits.wall_clock_s
+        err = ErrorRecord(ts_ms=now, attempt=task.attempt_count, error_class="timeout", retryable=True,
+                          detail=f"wall-clock limit of {limit_s}s exceeded")
+        self._close_reservation(conn, task, task.attempt_count, run_id=run_row["run_id"], settle=True, usage=None)
+        ctx = GuardContext(error_retryable=True)
+        if task.timeout_retries < self.limits.max_timeout_retries and \
+                run_guard("retry_allowed", self._guard_input(conn, task, SYSTEM, ctx)) is None:
+            res = self._reserve(conn, task)
+            if not res.ok:
+                return self._apply(conn, task, Event.BLOCK, SYSTEM, GuardContext(block_reason=BlockReason.BUDGET_INSUFFICIENT),
+                                   reason=f"timeout retry blocked: {res.reason}", error=err, run_end=RunState.TIMED_OUT)
+            self._apply(conn, task, Event.RETRY, SYSTEM, ctx, reason="wall-clock timeout; timeout retry", error=err,
+                        run_end=RunState.TIMED_OUT)
+            conn.execute("UPDATE tasks SET timeout_retries=timeout_retries+1 WHERE task_id=?", (task.task_id,))
+            return self._load_task(conn, task.task_id)
+        return self._apply(conn, task, Event.TIMEOUT, SYSTEM, ctx, reason="wall-clock timeout", error=err, run_end=RunState.TIMED_OUT)
+
+    def time_out_run(self, run_id: str, *, actor: Actor = SYSTEM) -> TaskRecord:
+        """Expire one run whose wall-clock limit is reached (elapsed >= wall_clock_s). Refused before that."""
+        with self._denial_scope(actor, "run.timeout"), self._tx() as conn:
+            self._check_actor(conn, actor)
+            authorize(actor.kind, "run.timeout")
+            r = conn.execute("SELECT * FROM runs WHERE run_id=?", (run_id,)).fetchone()
+            if r is None:
+                raise NotFound(f"run {run_id!r}")
+            if r["state"] != "running":
+                raise GuardFailed("time_out_run", f"run is {r['state']}, not running")
+            task = self._load_task(conn, r["task_id"])
+            if self.clock.now_ms() < self._run_deadline_ms(r, task):
+                raise GuardFailed("time_out_run", "wall-clock limit not reached")
+            return self._time_out_run_row(conn, task, r)
+
+    def run_deadline_passed(self, run_id: str) -> bool:
+        """True if the run is still `running` but its wall-clock limit is reached (read-only)."""
+        r = self._read().execute("SELECT * FROM runs WHERE run_id=?", (run_id,)).fetchone()
+        if r is None or r["state"] != "running":
+            return False
+        return self.clock.now_ms() >= self._run_deadline_ms(r, self._load_task(self._read(), r["task_id"]))
+
+    def time_out_expired_runs(self, *, actor: Actor = SYSTEM) -> list[str]:
+        """Sweep every running run (any worker, any adapter) past its deadline, in run_seq order."""
+        ids = [x[0] for x in self._read().execute("SELECT run_id FROM runs WHERE state='running' ORDER BY run_seq")]
+        done: list[str] = []
+        for rid in ids:
+            try:
+                self.time_out_run(rid, actor=actor)
+                done.append(rid)
+            except GuardFailed:
+                continue
+        return done
+
     def recover_leases(self, current_worker_id: str | None = None, *, actor: Actor = SYSTEM) -> RecoveryReport:
         """Deterministic recovery (ordered by run_seq) of runs whose lease expired, or whose owner is not `current_worker_id`.
 

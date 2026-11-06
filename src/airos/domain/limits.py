@@ -11,6 +11,7 @@ class Limits:
     max_total_tasks_per_root: int = 25
     max_review_cycles: int = 2
     max_concurrent_runs: int = 2
+    max_timeout_retries: int = 1
     lease_ttl_ms: int = 60_000
     approval_ttl_ms: int = 72 * 3600 * 1000
     review_ttl_ms: int = 72 * 3600 * 1000

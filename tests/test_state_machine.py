@@ -93,7 +93,7 @@ def test_reviewer_independence_guard_is_pure():
                       parent_task_id=None, depth=0, assigned_role=Role.EXECUTOR, state=TaskState.REVIEW, version=1,
                       contract_version=1, blocked_reason=None, blocked_from=None, contract=c,
                       contract_sha256=contract_sha256(c), side_effect_class=SideEffectClass.NONE, attempt_count=1,
-                      review_cycles=0, not_before_ms=None, error_history=[], created_by="h", created_at_ms=0,
+                      review_cycles=0, timeout_retries=0, not_before_ms=None, error_history=[], created_by="h", created_at_ms=0,
                       updated_at_ms=0, state_entered_at_ms=0)
     facts = Facts(True, False, True, producer_id="same-id", children_all_completed=True, has_children=False,
                   ms_in_state=0, now_ms=0)

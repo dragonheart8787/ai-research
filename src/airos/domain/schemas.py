@@ -274,6 +274,7 @@ class TaskRecord(StrictModel):
     side_effect_class: SideEffectClass
     attempt_count: int
     review_cycles: int
+    timeout_retries: int
     not_before_ms: int | None
     error_history: list[ErrorRecord]
     created_by: str
