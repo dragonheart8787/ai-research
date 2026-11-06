@@ -49,6 +49,7 @@ EXPECTED_OPS: dict[str, set[ActorKind]] = {
     "artifact.register": {K.HUMAN, K.SYSTEM},
     "artifact.release": {K.HUMAN},
     "audit.append_system_event": {K.SYSTEM},
+    "cascade.cancel": {K.SYSTEM},
 }
 EVENT_ACTIONS = {f"event:{e.value}" for e in Event}
 
@@ -137,6 +138,7 @@ def _ops(repo):
     bi = repo.request_budget_increase(root.task_id, f"root:{root.root_task_id}", 5, 5, SYSTEM)
     repo.decide_approval(bi.approval_id, True, HUMAN)
     approved = approve_fully(repo, repo.create_task(make_contract(), HUMAN).task)
+    cancelled = repo.transition(repo.create_task(make_contract(), HUMAN).task.task_id, Event.CANCEL, HUMAN, 1)
     counter = itertools.count()
     amend = make_contract(idempotency_key=draft.idempotency_key, research_objective="amended")
     art = lambda actor: Artifact(  # noqa: E731
@@ -161,6 +163,7 @@ def _ops(repo):
         "artifact.register": lambda a: repo.add_artifact(art(a), a),
         "artifact.release": lambda a: repo.release_artifact("no-such-artifact", a),
         "audit.append_system_event": lambda a: repo.record_system_event("worker.error", {"x": 1}, actor=a),
+        "cascade.cancel": lambda a: repo.cascade_cancel_descendants(cancelled.task_id, actor=a),
     }
 
 

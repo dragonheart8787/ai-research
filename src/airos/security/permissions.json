@@ -36,6 +36,9 @@
     "budget.set": [
       "human"
     ],
+    "cascade.cancel": [
+      "system"
+    ],
     "event:accept": [
       "director",
       "human"

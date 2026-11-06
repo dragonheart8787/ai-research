@@ -537,7 +537,7 @@ class SqliteRepository:
     def _apply(
         self, conn: sqlite3.Connection, task: TaskRecord, event: Event, actor: Actor, ctx: GuardContext,
         *, reason: str | None = None, error: ErrorRecord | None = None, run_end: RunState | None = None,
-        usage: ResourceUsage | None = None,
+        usage: ResourceUsage | None = None, cause: tuple[str, str] | None = None,
     ) -> TaskRecord:
         tr = decide(task.state, event, actor.kind)  # pure table lookup + actor check (ActorNotAllowed)
         authorize(actor.kind, f"event:{event.value}")  # the permissions matrix must agree (tested)
@@ -591,18 +591,38 @@ class SqliteRepository:
         self._append_event(
             conn, "task.transition", actor, task_id=task.task_id, run_id=run_id,
             from_state=task.state.value, to_state=tr.to_state.value,
-            payload={"event": event.value, "transition": tr.tid, "reason": reason, "version": task.version + 1},
+            payload={"event": event.value, "transition": tr.tid, "reason": reason, "version": task.version + 1,
+                     **({"cause_task_id": cause[0], "cause_event": cause[1]} if cause else {})},
             anchor=event is Event.ACCEPT and task.parent_task_id is None,
         )
-        if event in (Event.CANCEL, Event.CASCADE_CANCEL):
-            kids = [r[0] for r in conn.execute(
-                "SELECT task_id FROM tasks WHERE parent_task_id=? AND state NOT IN ('completed','failed','timed_out','cancelled')",
-                (task.task_id,),
-            )]
-            for kid in kids:
-                self._apply(conn, self._load_task(conn, kid), Event.CASCADE_CANCEL, SYSTEM, GuardContext(cascade=True),
-                            reason=f"parent {task.task_id} cancelled")
+        failed_objective = event in (Event.FAIL, Event.TIMEOUT) and task.kind is TaskKind.OBJECTIVE
+        if event in (Event.CANCEL, Event.CASCADE_CANCEL) or failed_objective:
+            self._cascade(conn, task.task_id, cause or (task.task_id, event.value))
         return self._load_task(conn, task.task_id)
+
+    def _cascade(self, conn: sqlite3.Connection, parent_id: str, cause: tuple[str, str]) -> list[str]:
+        """SYSTEM cancels every non-terminal descendant. Running children lose their lease (their run is closed as
+        cancelled) and settle at WORST CASE; queued children release their reservation; each event names the causal task."""
+        authorize(SYSTEM.kind, "cascade.cancel")
+        done: list[str] = []
+        kids = [r[0] for r in conn.execute(
+            "SELECT task_id FROM tasks WHERE parent_task_id=? AND state NOT IN ('completed','failed','timed_out','cancelled') "
+            "ORDER BY created_at_ms, task_id", (parent_id,))]
+        for kid in kids:
+            self._apply(conn, self._load_task(conn, kid), Event.CASCADE_CANCEL, SYSTEM, GuardContext(cascade=True),
+                        reason=f"ancestor {cause[0]} ended ({cause[1]})", cause=cause)
+            done.append(kid)
+        return done
+
+    def cascade_cancel_descendants(self, task_id: str, *, actor: Actor = SYSTEM) -> list[str]:
+        """Idempotent repair/entry point: cancel every live descendant of a task that has already ended unsuccessfully."""
+        with self._denial_scope(actor, "cascade.cancel", task_id), self._tx() as conn:
+            self._check_actor(conn, actor)
+            authorize(actor.kind, "cascade.cancel")
+            task = self._load_task(conn, task_id)
+            if task.state not in (TaskState.FAILED, TaskState.TIMED_OUT, TaskState.CANCELLED):
+                raise GuardFailed("cascade", f"task is {task.state.value}; only an ended task cascades")
+            return self._cascade(conn, task_id, (task_id, task.state.value))
 
     # ------------------------------------------------------------ budget (ledger-backed; same transaction as the transition)
 
