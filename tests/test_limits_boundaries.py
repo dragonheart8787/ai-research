@@ -111,10 +111,11 @@ def test_total_tasks_per_root_boundary(repo):
             _child(repo, k)
     n = repo._conn().execute("SELECT COUNT(*) FROM tasks WHERE root_task_id=?", (root.task_id,)).fetchone()[0]
     assert n == D.max_total_tasks_per_root == 25
-    with pytest.raises(LimitExceeded, match="max_total_tasks_per_root=25"):   # 26th rejected
-        _child(repo, kids[2])
-    # a different root is unaffected
-    assert _child(repo, _root(repo)).depth == 1
+    flags = repo._conn().execute("SELECT COUNT(*) FROM tasks WHERE root_task_id=? AND over_root_limit=1", (root.task_id,)).fetchone()[0]
+    assert flags == 0                                                # up to and including the 25th: no approval needed
+    twenty_sixth = _child(repo, kids[2])                             # limit+1: created, but BLOCKED behind a human approval
+    assert twenty_sixth.over_root_limit is True
+    assert _child(repo, _root(repo)).over_root_limit is False        # a different root is unaffected
 
 
 def test_limits_cannot_be_exceeded_by_duplicate_creation_either(repo):

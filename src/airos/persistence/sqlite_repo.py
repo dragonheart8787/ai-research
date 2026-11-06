@@ -358,7 +358,8 @@ class SqliteRepository:
             blocked_from=TaskState(r["blocked_from"]) if r["blocked_from"] else None,
             contract=TaskContract.model_validate_json(r["contract_json"]), contract_sha256=r["contract_sha256"],
             side_effect_class=SideEffectClass(r["side_effect_class"]), attempt_count=r["attempt_count"],
-            review_cycles=r["review_cycles"], timeout_retries=r["timeout_retries"], not_before_ms=r["not_before_ms"],
+            review_cycles=r["review_cycles"], timeout_retries=r["timeout_retries"], over_root_limit=bool(r["over_root_limit"]),
+            not_before_ms=r["not_before_ms"],
             error_history=[ErrorRecord.model_validate(e) for e in json.loads(r["error_history_json"])],
             created_by=r["created_by"], created_at_ms=r["created_at_ms"], updated_at_ms=r["updated_at_ms"],
             state_entered_at_ms=r["state_entered_at_ms"],
@@ -432,6 +433,7 @@ class SqliteRepository:
                 self._check_inputs(conn, contract)
                 task_id = self._new_id()
                 depth, root = 0, task_id
+                over_limit = False
                 if parent_task_id is not None:
                     parent = self._load_task(conn, parent_task_id)
                     if parent.state in TERMINAL_STATES:
@@ -443,21 +445,23 @@ class SqliteRepository:
                     if n_children >= self.limits.max_children_per_task:
                         raise LimitExceeded(f"max_children_per_task={self.limits.max_children_per_task}")
                     n_root = conn.execute("SELECT COUNT(*) FROM tasks WHERE root_task_id=?", (root,)).fetchone()[0]
-                    if n_root >= self.limits.max_total_tasks_per_root:
-                        raise LimitExceeded(f"max_total_tasks_per_root={self.limits.max_total_tasks_per_root}")
+                    if n_root >= self.limits.hard_max_total_tasks_per_root:
+                        raise LimitExceeded(f"hard_max_total_tasks_per_root={self.limits.hard_max_total_tasks_per_root}")
+                    over_limit = n_root >= self.limits.max_total_tasks_per_root
                 now = self.clock.now_ms()
                 conn.execute(
                     "INSERT INTO tasks(task_id,idempotency_key,kind,root_task_id,parent_task_id,depth,assigned_role,state,"
                     "version,contract_version,contract_json,contract_sha256,side_effect_class,created_by,created_at_ms,"
-                    "updated_at_ms,state_entered_at_ms) VALUES(?,?,?,?,?,?,?,?,1,1,?,?,?,?,?,?,?)",
+                    "updated_at_ms,state_entered_at_ms,over_root_limit) VALUES(?,?,?,?,?,?,?,?,1,1,?,?,?,?,?,?,?,?)",
                     (task_id, contract.idempotency_key, contract.kind.value, root, parent_task_id, depth,
                      contract.assigned_role.value, TaskState.DRAFT.value,
                      canonical_json(contract.model_dump(mode="json")), chash, contract.side_effect_class.value,
-                     creator.id, now, now, now),
+                     creator.id, now, now, now, int(over_limit)),
                 )
                 self._append_event(
                     conn, "task.created", creator, task_id=task_id, to_state=TaskState.DRAFT.value,
-                    payload={"contract_sha256": chash, "parent_task_id": parent_task_id, "depth": depth},
+                    payload={"contract_sha256": chash, "parent_task_id": parent_task_id, "depth": depth,
+                             "over_root_limit": over_limit},
                 )
                 result = CreateResult(self._load_task(conn, task_id), True)
         if conflict is not None:
@@ -491,9 +495,17 @@ class SqliteRepository:
 
     # ------------------------------------------------------------ facts / guard input
 
+    @staticmethod
+    def _required_types(task: TaskRecord) -> frozenset[str]:
+        """Approval types this task needs: its contract's, plus `limit_increase` if it exceeded the per-root task limit."""
+        need = {r.type.value for r in task.contract.approval_requirements}
+        if task.over_root_limit:
+            need.add(ApprovalType.LIMIT_INCREASE.value)
+        return frozenset(need)
+
     def _facts(self, conn: sqlite3.Connection, task: TaskRecord) -> Facts:
         now = self.clock.now_ms()
-        needed = {r.type.value for r in task.contract.approval_requirements}
+        needed = set(self._required_types(task))
         granted = {
             r[0] for r in conn.execute(
                 "SELECT approval_type FROM approvals WHERE task_id=? AND status='granted' AND task_version=? AND contract_sha256=? "
@@ -520,7 +532,7 @@ class SqliteRepository:
             producer_id=prod["agent_id"] if prod else None, children_all_completed=n_kids == n_done,
             has_children=n_kids > 0, ms_in_state=now - task.state_entered_at_ms, now_ms=now,
             reservation_held=budget_sql.open_task_reserve(conn, task.task_id, task.attempt_count + 1) is not None,
-            side_effectful=self._effective_side_effectful(task),
+            side_effectful=self._effective_side_effectful(task), required_types=self._required_types(task),
         )
 
     def _expire_stale_grants(self, conn: sqlite3.Connection, task_id: str) -> int:
@@ -721,7 +733,7 @@ class SqliteRepository:
                          "contract_version": task.contract_version + 1, "approvals_invalidated": n_inval},
             )
             updated = self._load_task(conn, task_id)
-            if updated.state is TaskState.APPROVED and updated.contract.approval_requirements:
+            if updated.state is TaskState.APPROVED and self._required_types(updated):
                 updated = self._apply(conn, updated, Event.REAPPROVE, SYSTEM, GuardContext(), reason="contract amended; approvals invalidated")
             return updated
 
@@ -754,8 +766,8 @@ class SqliteRepository:
             self._expire_stale_grants(conn, task_id)
             if task.state not in (TaskState.PLANNED, TaskState.AWAITING_APPROVAL):
                 raise GuardFailed("request_approval", f"cannot request approval in state {task.state.value}")
-            if approval_type not in {r.type for r in task.contract.approval_requirements}:
-                raise GuardFailed("request_approval", f"{approval_type.value} is not required by this contract")
+            if approval_type.value not in self._required_types(task):
+                raise GuardFailed("request_approval", f"{approval_type.value} is not required for this task")
             row = conn.execute(
                 "SELECT * FROM approvals WHERE task_id=? AND approval_type=? AND task_version=? AND budget_id IS NULL AND status IN ('pending','granted')",
                 (task_id, approval_type.value, task.contract_version),

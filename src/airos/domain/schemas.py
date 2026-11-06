@@ -275,6 +275,7 @@ class TaskRecord(StrictModel):
     attempt_count: int
     review_cycles: int
     timeout_retries: int
+    over_root_limit: bool = False
     not_before_ms: int | None
     error_history: list[ErrorRecord]
     created_by: str

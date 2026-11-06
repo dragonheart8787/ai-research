@@ -42,6 +42,7 @@ class Facts:
     ms_in_state: int
     now_ms: int
     reservation_held: bool = False
+    required_types: frozenset[str] = frozenset()  # contract requirements + limit_increase when over the per-root limit
     side_effectful: bool = False
 
 
@@ -58,7 +59,7 @@ Guard = Callable[[GuardInput], str | None]
 
 
 def _requirements(i: GuardInput) -> bool:
-    return bool(i.task.contract.approval_requirements)
+    return bool(i.facts.required_types)
 
 
 def plan_valid(i: GuardInput) -> str | None:

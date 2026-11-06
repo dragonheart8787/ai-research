@@ -137,17 +137,21 @@ def test_creation_permissions(repo):
 
 
 def test_recursion_limits(open_repo):
-    repo = open_repo(limits=Limits(max_subtask_depth=2, max_children_per_task=2, max_total_tasks_per_root=4))
+    repo = open_repo(limits=Limits(max_subtask_depth=2, max_children_per_task=2, max_total_tasks_per_root=4,
+                                   hard_max_total_tasks_per_root=5))
     root = repo.create_task(make_contract(), HUMAN).task
     a = repo.create_task(make_contract(), PLANNER, root.task_id).task
-    repo.create_task(make_contract(), PLANNER, root.task_id)
+    other = repo.create_task(make_contract(), PLANNER, root.task_id).task
     with pytest.raises(LimitExceeded, match="children"):
         repo.create_task(make_contract(), PLANNER, root.task_id)
-    b = repo.create_task(make_contract(), PLANNER, a.task_id).task  # depth 2 ok; total now 4
+    b = repo.create_task(make_contract(), PLANNER, a.task_id).task  # depth 2 ok; total now 4 (= the limit, no flag)
+    assert b.over_root_limit is False
     with pytest.raises(LimitExceeded, match="depth"):
         repo.create_task(make_contract(), PLANNER, b.task_id)
-    with pytest.raises(LimitExceeded, match="total"):
-        repo.create_task(make_contract(), PLANNER, a.task_id)
+    fifth = repo.create_task(make_contract(), PLANNER, a.task_id).task   # beyond the limit: allowed but flagged
+    assert fifth.over_root_limit is True
+    with pytest.raises(LimitExceeded, match="hard_max_total_tasks_per_root=5"):   # beyond the HARD cap: rejected
+        repo.create_task(make_contract(), PLANNER, other.task_id)
 
 
 def test_cancel_cascades_to_descendants_and_closes_running_run(repo):

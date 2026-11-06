@@ -8,7 +8,8 @@ from dataclasses import dataclass
 class Limits:
     max_subtask_depth: int = 3
     max_children_per_task: int = 8
-    max_total_tasks_per_root: int = 25
+    max_total_tasks_per_root: int = 25  # beyond this a human `limit_increase` approval is required
+    hard_max_total_tasks_per_root: int = 100  # beyond this: always rejected (PROPOSAL 4.4 HARD cap)
     max_review_cycles: int = 2
     max_concurrent_runs: int = 2
     max_timeout_retries: int = 1
