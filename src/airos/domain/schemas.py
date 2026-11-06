@@ -56,6 +56,7 @@ class ArtifactClass(str, Enum):
     EXTERNAL_HANDOFF = "external_handoff"
     SCIENTIST_OUTPUT = "scientist_output"
     EVAL_RESULT = "eval_result"
+    FINAL_EVALUATION = "final_evaluation"  # held-out data: unreadable by every agent role
 
 
 class TrustLevel(str, Enum):
@@ -407,6 +408,9 @@ class Approval(StrictModel):
     decided_by: str | None = None
     decided_at_ms: int | None = None
     reason: str | None = None
+    budget_id: str | None = None  # only for budget_increase approvals
+    amount_usd_micro: int | None = None
+    amount_tokens: int | None = None
 
 
 class LedgerKind(str, Enum):
@@ -428,6 +432,8 @@ class BudgetLedgerEntry(StrictModel):
     tokens: int = 0
     wall_s: int = 0
     approval_id: str | None = None
+    attempt: int | None = None
+    reserve_ref: str | None = None
     idempotency_key: str = Field(min_length=1, max_length=200)
     created_at_ms: int
 

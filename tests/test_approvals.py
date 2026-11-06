@@ -68,7 +68,7 @@ def test_budget_change_counts_as_contract_change(repo):
     t2 = repo.amend_task(t.task_id, bigger, t.version, HUMAN)
     assert t2.contract_version == 2 and t2.state is TaskState.AWAITING_APPROVAL
     with pytest.raises(IllegalTransition):  # cannot slip past to queue with the old approval
-        repo.transition(t.task_id, Event.QUEUE, SYSTEM, t2.version)
+        repo.queue_task(t.task_id, t2.version)
 
 
 def test_decision_on_pending_approval_made_stale_by_amendment_is_refused(repo):
@@ -164,15 +164,3 @@ def test_request_approval_only_for_required_types(repo):
         repo.request_approval(t.task_id, ApprovalType.DESTRUCTIVE, SYSTEM)
 
 
-def test_ledger_grant_requires_human_granted_approval(repo):
-    from airos.domain.schemas import BudgetLedgerEntry
-
-    t = _awaiting(repo)
-    ap = repo.request_approval(t.task_id, ApprovalType.COST, SYSTEM)
-    entry = BudgetLedgerEntry(entry_id="g1", budget_id="b", kind="grant", usd_micro=10, approval_id=ap.approval_id,
-                              idempotency_key="grant:1", created_at_ms=1)
-    with pytest.raises(NotAuthorized):
-        repo.append_ledger_entry(entry, SYSTEM)       # approval still pending
-    repo.decide_approval(ap.approval_id, True, HUMAN)
-    assert repo.append_ledger_entry(entry, SYSTEM).entry_id == "g1"
-    assert repo.append_ledger_entry(entry, SYSTEM).entry_id == "g1" and len(repo.list_ledger("b")) == 1  # idempotent

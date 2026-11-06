@@ -10,13 +10,14 @@ requires-python = ">=3.11"
 dependencies = ["pydantic>=2.6,<3"]
 
 [project.optional-dependencies]
-dev = ["pytest", "hypothesis", "ruff", "mypy"]
+dev = ["pytest", "hypothesis", "ruff", "mypy", "httpx"]
+api = ["fastapi", "uvicorn"]
 
 [tool.setuptools.packages.find]
 where = ["src"]
 
 [tool.setuptools.package-data]
-airos = ["persistence/migrations/*.sql"]
+airos = ["persistence/migrations/*.sql", "security/permissions.json"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

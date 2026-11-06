@@ -18,6 +18,13 @@ class Limits:
     backoff_base_ms: int = 30_000
     backoff_cap_ms: int = 600_000
     director_may_create_root: bool = False
+    # Default budgets (PROPOSAL Q2). Real adapters start at $0 / 0 tokens until a human grants budget.
+    default_root_usd_micro: int = 10_000_000
+    default_root_tokens: int = 20_000_000
+    default_global_daily_usd_micro: int = 25_000_000
+    default_global_daily_tokens: int = 50_000_000
+    real_adapter_default_usd_micro: int = 0
+    real_adapter_default_tokens: int = 0
 
     def backoff_ms(self, attempt: int) -> int:
         """Deterministic exponential backoff (no jitter in M1; jitter is a scheduler concern)."""

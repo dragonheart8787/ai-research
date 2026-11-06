@@ -9,7 +9,7 @@ from dataclasses import dataclass, field
 
 from airos.domain.limits import Limits
 from airos.domain.schemas import Role, TaskRecord
-from airos.domain.states import SIDE_EFFECTFUL, Actor, ActorKind, BlockReason, TaskState
+from airos.domain.states import Actor, ActorKind, BlockReason, TaskState
 
 # Roles whose output may only be accepted by a human (PROPOSAL T23).
 HUMAN_REVIEW_ROLES = frozenset({Role.DIRECTOR, Role.PLANNER, Role.CHATGPT_WORK, Role.AI_SCIENTIST})
@@ -20,7 +20,6 @@ class GuardContext:
     """Facts only the caller (M2 services) can know. Defaults are the restrictive value."""
 
     plan_ok: bool = False
-    budget_reserved: bool = False
     verifier_passed: bool = False
     error_retryable: bool = False
     blocker_cleared: bool = False
@@ -42,6 +41,8 @@ class Facts:
     has_children: bool
     ms_in_state: int
     now_ms: int
+    reservation_held: bool = False
+    side_effectful: bool = False
 
 
 @dataclass(frozen=True)
@@ -104,8 +105,6 @@ def block_reason(i: GuardInput) -> str | None:
 
 
 def start_ok(i: GuardInput) -> str | None:
-    if not i.ctx.budget_reserved:
-        return "budget reservation not confirmed"
     t = i.task.not_before_ms
     if t is not None and t > i.facts.now_ms:
         return "not_before has not elapsed"
@@ -123,7 +122,7 @@ def finish_ok(i: GuardInput) -> str | None:
 def retry_allowed(i: GuardInput) -> str | None:
     if not i.ctx.error_retryable:
         return "error is not retryable"
-    if i.task.side_effect_class in SIDE_EFFECTFUL:
+    if i.facts.side_effectful:
         return "side-effectful tasks are never auto-retried"
     if i.task.attempt_count >= 1 + i.task.contract.resource_limits.max_retries:
         return "retries exhausted"
@@ -174,6 +173,15 @@ def unblock_ok(i: GuardInput) -> str | None:
     return None
 
 
+def reservation_held(i: GuardInput) -> str | None:
+    """Reads the ledger (via Facts, computed in the same transaction): an OPEN task-level reserve row must exist."""
+    if i.task.kind.value == "objective":
+        return None  # containers have no run and no spend
+    if i.facts.reservation_held:
+        return None
+    return f"no open ledger reservation for attempt {i.task.attempt_count + 1}"
+
+
 def cascade_only(i: GuardInput) -> str | None:
     return None if i.ctx.cascade else "cascade_cancel is only valid as part of a parent cancellation"
 
@@ -183,12 +191,19 @@ GUARDS: dict[str, Guard] = {
     for g in (
         plan_valid, needs_approval, auto_approvable, approvals_valid, approval_expired, approvals_stale,
         queue_ok, block_reason, start_ok, finish_ok, retry_allowed, reviewer_ok, rework_allowed,
-        review_ttl, blocked_ttl, unblock_ok, cascade_only,
+        review_ttl, blocked_ttl, unblock_ok, cascade_only, reservation_held,
     )
 }
 
 
+def run_guards(names: tuple[str, ...], i: GuardInput) -> tuple[str, str] | None:
+    """Evaluate guards in order; return (guard_name, message) of the first failure, else None."""
+    for name in names:
+        msg = GUARDS[name](i)
+        if msg is not None:
+            return name, msg
+    return None
+
+
 def run_guard(name: str | None, i: GuardInput) -> str | None:
-    if name is None:
-        return None
-    return GUARDS[name](i)
+    return None if name is None else GUARDS[name](i)

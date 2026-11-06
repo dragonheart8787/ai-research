@@ -11,8 +11,9 @@ import os
 import sqlite3
 import threading
 import uuid
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterable, Iterator
 from contextlib import contextmanager
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -26,7 +27,7 @@ from airos.audit import (
 )
 from airos.canonical import canonical_json
 from airos.clock import Clock, SystemClock
-from airos.domain.guards import Facts, GuardContext, GuardInput, run_guard
+from airos.domain.guards import Facts, GuardContext, GuardInput, run_guard, run_guards
 from airos.domain.limits import Limits
 from airos.domain.machine import allowed_state_pairs, decide
 from airos.domain.schemas import (
@@ -34,15 +35,18 @@ from airos.domain.schemas import (
     ApprovalStatus,
     ApprovalType,
     Artifact,
+    ArtifactClass,
     AuditEvent,
     BudgetLedgerEntry,
     ErrorRecord,
     LedgerKind,
+    ResourceUsage,
     Role,
     Run,
     TaskContract,
     TaskKind,
     TaskRecord,
+    TrustLevel,
     contract_sha256,
     provenance_hash,
     required_approval_types,
@@ -61,6 +65,7 @@ from airos.domain.states import (
 )
 from airos.errors import (
     ApprovalExpired,
+    BudgetInsufficient,
     GuardFailed,
     IdempotencyConflict,
     LeaseLost,
@@ -72,11 +77,28 @@ from airos.errors import (
     StaleApproval,
     VersionConflict,
 )
+from airos.persistence import budget_sql
+from airos.persistence.denials import DenialAuditor
 from airos.persistence.interfaces import AuditHead, CreateResult, RecoveryAction, RecoveryReport, Repository
 from airos.persistence.migrate import migrate
 from airos.redaction import Redactor
+from airos.security.permissions import authorize, may_read_artifact
 
 SYSTEM = Actor(ActorKind.SYSTEM, "system")
+
+
+@dataclass(frozen=True)
+class BudgetStatus:
+    budget_id: str
+    limit_usd_micro: int
+    limit_tokens: int
+    used_usd_micro: int  # outstanding reservations + settled spend
+    used_tokens: int
+    state: str
+
+    @property
+    def available_usd_micro(self) -> int:
+        return self.limit_usd_micro - self.used_usd_micro
 
 _DEFAULT_RUN_END: dict[Event, RunState] = {
     Event.FINISH: RunState.SUCCEEDED,
@@ -98,6 +120,8 @@ class SqliteRepository:
         id_factory: Callable[[], str] | None = None,
         limits: Limits | None = None,
         anchor_path: str | os.PathLike[str] | None = None,
+        real_roles: Iterable[str] = (),
+        workspace_fresh_guaranteed: bool = False,
     ) -> None:
         self.path = str(path)
         self.clock: Clock = clock or SystemClock()
@@ -105,6 +129,9 @@ class SqliteRepository:
         self._new_id = id_factory or (lambda: uuid.uuid4().hex)
         self.limits = limits or Limits()
         self.anchor_path = Path(anchor_path) if anchor_path else None
+        self._real_roles = frozenset(real_roles)
+        self._workspace_fresh_guaranteed = workspace_fresh_guaranteed
+        self._denials = DenialAuditor(self)
         self._local = threading.local()
         self._conns: list[sqlite3.Connection] = []
         self._conns_lock = threading.Lock()
@@ -119,22 +146,55 @@ class SqliteRepository:
 
     # ------------------------------------------------------------ connection / tx
 
+    def _connect(self) -> sqlite3.Connection:
+        c = sqlite3.connect(self.path, timeout=5.0, isolation_level=None)
+        c.row_factory = sqlite3.Row
+        if str(c.execute("PRAGMA journal_mode").fetchone()[0]).lower() != "wal":
+            c.execute("PRAGMA journal_mode=WAL")
+        c.execute("PRAGMA synchronous=FULL")
+        c.execute("PRAGMA foreign_keys=ON")
+        c.execute("PRAGMA busy_timeout=5000")
+        with self._conns_lock:
+            self._conns.append(c)
+        return c
+
     def _conn(self) -> sqlite3.Connection:
         c: sqlite3.Connection | None = getattr(self._local, "conn", None)
         if c is None:
-            c = sqlite3.connect(self.path, timeout=5.0, isolation_level=None)
-            c.row_factory = sqlite3.Row
-            if str(c.execute("PRAGMA journal_mode").fetchone()[0]).lower() != "wal":
-                c.execute("PRAGMA journal_mode=WAL")
-            c.execute("PRAGMA synchronous=FULL")
-            c.execute("PRAGMA foreign_keys=ON")
-            c.execute("PRAGMA busy_timeout=5000")
+            c = self._connect()
             self._local.conn = c
             self._local.anchors = []
-            with self._conns_lock:
-                self._conns.append(c)
         return c
 
+    def _denial_conn(self) -> sqlite3.Connection:
+        """A SECOND connection per thread, used only to audit denials after the main transaction rolled back."""
+        c: sqlite3.Connection | None = getattr(self._local, "dconn", None)
+        if c is None:
+            c = self._connect()
+            self._local.dconn = c
+        return c
+
+    @contextmanager
+    def _denial_scope(self, actor: Actor, action: str, task_id: str | None = None) -> Iterator[None]:
+        """Run the body; if it is denied, the main tx has already rolled back, then audit the denial separately."""
+        try:
+            yield
+        except NotAuthorized as exc:
+            self._denials.record(actor, action, task_id, str(exc))
+            raise
+
+    def set_runner_guarantee(self, fresh_dir_proven: bool) -> None:
+        """Called by the worker with the RESULT of the runner's fresh-directory proof (never a constant)."""
+        self._workspace_fresh_guaranteed = fresh_dir_proven
+
+    def set_real_roles(self, roles: Iterable[str]) -> None:
+        self._real_roles = frozenset(roles)
+
+    def _effective_side_effectful(self, task: TaskRecord) -> bool:
+        """external_write/destructive always. workspace_write only if fresh per-run dirs are NOT proven."""
+        if task.side_effect_class in SIDE_EFFECTFUL:
+            return True
+        return task.side_effect_class is SideEffectClass.WORKSPACE_WRITE and not self._workspace_fresh_guaranteed
     def close(self) -> None:
         with self._conns_lock:
             for c in self._conns:
@@ -326,19 +386,32 @@ class SqliteRepository:
             raise SecretInContract("task contract contains a secret-looking value; refusing to store it")
 
     def create_task(self, contract: TaskContract, creator: Actor, parent_task_id: str | None = None) -> CreateResult:
+        action = "task.create_child" if parent_task_id is not None else "task.create_root"
+        if (action == "task.create_root" and creator.kind is ActorKind.DIRECTOR
+                and self.limits.director_may_create_root):
+            action = "task.create_root_as_director"
+        with self._denial_scope(creator, action):
+            return self._create_task(contract, creator, parent_task_id, action)
+
+    def _check_inputs(self, conn: sqlite3.Connection, contract: TaskContract) -> None:
+        for ref in contract.input_artifact_refs:
+            row = conn.execute("SELECT sha256, artifact_class, trust_level FROM artifacts WHERE artifact_id=?",
+                               (ref.artifact_id,)).fetchone()
+            if row is None or row["sha256"] != ref.sha256:
+                raise GuardFailed("inputs", f"input artifact {ref.artifact_id!r} is not registered with that sha256")
+            if row["artifact_class"] == ArtifactClass.FINAL_EVALUATION.value:
+                raise GuardFailed("inputs", "final-evaluation artifacts can never be task inputs")
+            if row["trust_level"] == TrustLevel.QUARANTINED.value:
+                raise GuardFailed("inputs", "quarantined artifacts must be released by a human before use")
+
+    def _create_task(self, contract: TaskContract, creator: Actor, parent_task_id: str | None, action: str) -> CreateResult:
         self._assert_no_secrets(contract)
         chash = contract_sha256(contract)
         conflict: str | None = None
         result: CreateResult
         with self._tx() as conn:
             self._check_actor(conn, creator)
-            allowed = (
-                creator.kind is ActorKind.HUMAN
-                or (creator.kind is ActorKind.PLANNER and parent_task_id is not None)
-                or (creator.kind is ActorKind.DIRECTOR and parent_task_id is None and self.limits.director_may_create_root)
-            )
-            if not allowed:
-                raise NotAuthorized(f"{creator.kind.value} may not create this task")
+            authorize(creator.kind, action)
             existing = conn.execute("SELECT * FROM tasks WHERE idempotency_key=?", (contract.idempotency_key,)).fetchone()
             if existing is not None:
                 task = self._row_to_task(existing)
@@ -353,6 +426,7 @@ class SqliteRepository:
                     conflict = contract.idempotency_key
                     result = CreateResult(task, False)
             else:
+                self._check_inputs(conn, contract)
                 task_id = self._new_id()
                 depth, root = 0, task_id
                 if parent_task_id is not None:
@@ -388,10 +462,13 @@ class SqliteRepository:
         return result
 
     def add_dependency(self, task_id: str, depends_on_task_id: str, actor: Actor) -> None:
+        with self._denial_scope(actor, "task.add_dependency", task_id):
+            self._add_dependency(task_id, depends_on_task_id, actor)
+
+    def _add_dependency(self, task_id: str, depends_on_task_id: str, actor: Actor) -> None:
         with self._tx() as conn:
             self._check_actor(conn, actor)
-            if actor.kind not in (ActorKind.HUMAN, ActorKind.PLANNER):
-                raise NotAuthorized("only human or planner may add dependencies")
+            authorize(actor.kind, "task.add_dependency")
             t = self._load_task(conn, task_id)
             self._load_task(conn, depends_on_task_id)
             if t.state is not TaskState.DRAFT:
@@ -438,6 +515,8 @@ class SqliteRepository:
             approvals_valid=needed <= granted, approvals_expired=expired, deps_done=open_deps == 0,
             producer_id=prod["agent_id"] if prod else None, children_all_completed=n_kids == n_done,
             has_children=n_kids > 0, ms_in_state=now - task.state_entered_at_ms, now_ms=now,
+            reservation_held=budget_sql.open_task_reserve(conn, task.task_id, task.attempt_count + 1) is not None,
+            side_effectful=self._effective_side_effectful(task),
         )
 
     def _guard_input(self, conn: sqlite3.Connection, task: TaskRecord, actor: Actor, ctx: GuardContext) -> GuardInput:
@@ -449,22 +528,23 @@ class SqliteRepository:
         self, task_id: str, event: Event, actor: Actor, expected_version: int,
         ctx: GuardContext | None = None, *, reason: str | None = None, error: ErrorRecord | None = None,
     ) -> TaskRecord:
-        with self._tx() as conn:
+        with self._denial_scope(actor, f"event:{event.value}", task_id), self._tx() as conn:
             self._check_actor(conn, actor)
             task = self._load_task(conn, task_id)
             if task.version != expected_version:
                 raise VersionConflict(f"task {task_id}: expected version {expected_version}, found {task.version}")
             return self._apply(conn, task, event, actor, ctx or GuardContext(), reason=reason, error=error)
-
     def _apply(
         self, conn: sqlite3.Connection, task: TaskRecord, event: Event, actor: Actor, ctx: GuardContext,
         *, reason: str | None = None, error: ErrorRecord | None = None, run_end: RunState | None = None,
+        usage: ResourceUsage | None = None,
     ) -> TaskRecord:
-        tr = decide(task.state, event, actor.kind)  # pure table lookup + actor check
+        tr = decide(task.state, event, actor.kind)  # pure table lookup + actor check (ActorNotAllowed)
+        authorize(actor.kind, f"event:{event.value}")  # the permissions matrix must agree (tested)
         gi = self._guard_input(conn, task, actor, ctx)
-        msg = run_guard(tr.guard, gi)
-        if msg is not None:
-            raise GuardFailed(tr.guard or "", msg)
+        failed = run_guards(tr.guards, gi)
+        if failed is not None:
+            raise GuardFailed(failed[0], failed[1])
         now = self.clock.now_ms()
         blocked_reason = blocked_from = None
         if event is Event.BLOCK:
@@ -489,12 +569,10 @@ class SqliteRepository:
         )
         if cur.rowcount != 1:
             raise VersionConflict(f"task {task.task_id}: lost compare-and-swap")
-        # approvals side effects
         if event in (Event.REQUEST_CHANGES, Event.DENY):
             conn.execute("UPDATE approvals SET status='revoked' WHERE task_id=? AND status IN ('pending','granted')", (task.task_id,))
         elif event is Event.EXPIRE:
             conn.execute("UPDATE approvals SET status='expired' WHERE task_id=? AND status='pending' AND expires_at_ms<=?", (task.task_id, now))
-        # close the active run when leaving `running`
         run_id: str | None = None
         if task.state is TaskState.RUNNING and task.kind is TaskKind.WORK:
             end = run_end or _DEFAULT_RUN_END.get(event, RunState.ABANDONED)
@@ -505,6 +583,11 @@ class SqliteRepository:
                     "UPDATE runs SET state=?, ended_at_ms=?, error_class=?, error_detail=? WHERE run_id=?",
                     (end.value, now, clean_err.error_class if clean_err else None, clean_err.detail if clean_err else None, run_id),
                 )
+        if task.kind is TaskKind.WORK:
+            if task.state is TaskState.RUNNING:  # settle: measured usage, or WORST CASE when unmeasured
+                self._close_reservation(conn, task, task.attempt_count, run_id=run_id, settle=True, usage=usage)
+            elif task.state is TaskState.QUEUED and tr.to_state is not TaskState.RUNNING:  # queued -> blocked/cancelled/...
+                self._close_reservation(conn, task, task.attempt_count + 1, run_id=None, settle=False, usage=None)
         self._append_event(
             conn, "task.transition", actor, task_id=task.task_id, run_id=run_id,
             from_state=task.state.value, to_state=tr.to_state.value,
@@ -521,7 +604,35 @@ class SqliteRepository:
                             reason=f"parent {task.task_id} cancelled")
         return self._load_task(conn, task.task_id)
 
+    # ------------------------------------------------------------ budget (ledger-backed; same transaction as the transition)
+
+    def _reserve(self, conn: sqlite3.Connection, task: TaskRecord) -> budget_sql.ReserveOutcome:
+        out = budget_sql.reserve(conn, task, self.limits, self.clock.now_ms(), task.assigned_role.value in self._real_roles, self._new_id)
+        if out.ok and not out.already_held:
+            self._append_event(conn, "budget.reserved", SYSTEM, task_id=task.task_id, payload={
+                "attempt": task.attempt_count + 1, "usd_micro": out.reserved_usd_micro, "tokens": out.reserved_tokens,
+                "levels": out.levels})
+        elif not out.ok:
+            self._append_event(conn, "budget.reservation_refused", SYSTEM, task_id=task.task_id,
+                               payload={"attempt": task.attempt_count + 1, "reason": out.reason})
+        return out
+
+    def _close_reservation(self, conn: sqlite3.Connection, task: TaskRecord, attempt: int, *, run_id: str | None,
+                           settle: bool, usage: ResourceUsage | None) -> None:
+        actual_u = usage.usd_micro if usage is not None else None
+        actual_t = (usage.tokens_in + usage.tokens_out) if usage is not None else None
+        n = budget_sql.close(conn, task, attempt, self.clock.now_ms(), self._new_id, run_id=run_id, settle=settle,
+                             actual_usd=actual_u, actual_tokens=actual_t)
+        if n:
+            self._append_event(conn, "budget.settled" if settle else "budget.released", SYSTEM, task_id=task.task_id,
+                               run_id=run_id, payload={"attempt": attempt, "levels": n,
+                                                       "worst_case": settle and usage is None,
+                                                       "usd_micro": actual_u, "tokens": actual_t})
     def amend_task(self, task_id: str, new_contract: TaskContract, expected_version: int, actor: Actor) -> TaskRecord:
+        with self._denial_scope(actor, "task.amend", task_id):
+            return self._amend_task(task_id, new_contract, expected_version, actor)
+
+    def _amend_task(self, task_id: str, new_contract: TaskContract, expected_version: int, actor: Actor) -> TaskRecord:
         self._assert_no_secrets(new_contract)
         new_hash = contract_sha256(new_contract)
         with self._tx() as conn:
@@ -529,11 +640,10 @@ class SqliteRepository:
             task = self._load_task(conn, task_id)
             if task.version != expected_version:
                 raise VersionConflict(f"task {task_id}: expected version {expected_version}, found {task.version}")
-            if actor.kind is ActorKind.PLANNER:
-                if task.state is not TaskState.DRAFT:
-                    raise NotAuthorized("planner may only amend draft tasks")
-            elif actor.kind is not ActorKind.HUMAN:
-                raise NotAuthorized(f"{actor.kind.value} may not amend tasks")
+            authorize(actor.kind, "task.amend")
+            if actor.kind is ActorKind.PLANNER and task.state is not TaskState.DRAFT:
+                raise NotAuthorized("planner may only amend draft tasks")
+            self._check_inputs(conn, new_contract)
             if task.state not in _AMENDABLE:
                 raise GuardFailed("amend", f"cannot amend a task in state {task.state.value}")
             if new_contract.idempotency_key != task.idempotency_key:
@@ -568,18 +678,23 @@ class SqliteRepository:
             contract_sha256=r["contract_sha256"], approval_type=ApprovalType(r["approval_type"]),
             status=ApprovalStatus(r["status"]), requested_by=r["requested_by"], requested_at_ms=r["requested_at_ms"],
             expires_at_ms=r["expires_at_ms"], decided_by=r["decided_by"], decided_at_ms=r["decided_at_ms"], reason=r["reason"],
+            budget_id=r["budget_id"], amount_usd_micro=r["amount_usd_micro"], amount_tokens=r["amount_tokens"],
         )
-
     def request_approval(self, task_id: str, approval_type: ApprovalType, requested_by: Actor) -> Approval:
+        with self._denial_scope(requested_by, "approval.request", task_id):
+            return self._request_approval(task_id, approval_type, requested_by)
+
+    def _request_approval(self, task_id: str, approval_type: ApprovalType, requested_by: Actor) -> Approval:
         with self._tx() as conn:
             self._check_actor(conn, requested_by)
+            authorize(requested_by.kind, "approval.request")
             task = self._load_task(conn, task_id)
             if task.state not in (TaskState.PLANNED, TaskState.AWAITING_APPROVAL):
                 raise GuardFailed("request_approval", f"cannot request approval in state {task.state.value}")
             if approval_type not in {r.type for r in task.contract.approval_requirements}:
                 raise GuardFailed("request_approval", f"{approval_type.value} is not required by this contract")
             row = conn.execute(
-                "SELECT * FROM approvals WHERE task_id=? AND approval_type=? AND task_version=? AND status IN ('pending','granted')",
+                "SELECT * FROM approvals WHERE task_id=? AND approval_type=? AND task_version=? AND budget_id IS NULL AND status IN ('pending','granted')",
                 (task_id, approval_type.value, task.contract_version),
             ).fetchone()
             if row is not None:
@@ -600,11 +715,14 @@ class SqliteRepository:
             return self._row_to_approval(conn.execute("SELECT * FROM approvals WHERE approval_id=?", (aid,)).fetchone())
 
     def decide_approval(self, approval_id: str, grant: bool, decided_by: Actor, reason: str | None = None) -> Approval:
-        if decided_by.kind is not ActorKind.HUMAN:
-            raise NotAuthorized("only a human principal may decide an approval")
+        with self._denial_scope(decided_by, "approval.decide"):
+            return self._decide_approval(approval_id, grant, decided_by, reason)
+
+    def _decide_approval(self, approval_id: str, grant: bool, decided_by: Actor, reason: str | None = None) -> Approval:
         deferred: Exception | None = None
         with self._tx() as conn:
             self._check_actor(conn, decided_by)
+            authorize(decided_by.kind, "approval.decide")
             row = conn.execute("SELECT * FROM approvals WHERE approval_id=?", (approval_id,)).fetchone()
             if row is None:
                 raise NotFound(f"approval {approval_id!r}")
@@ -655,8 +773,11 @@ class SqliteRepository:
     def list_runs(self, task_id: str) -> list[Run]:
         return [self._row_to_run(r) for r in self._read().execute("SELECT * FROM runs WHERE task_id=? ORDER BY attempt", (task_id,))]
 
-    def start_run(self, task_id: str, worker_id: str, agent_id: str, expected_version: int, ctx: GuardContext) -> Run:
-        with self._tx() as conn:
+    def start_run(self, task_id: str, worker_id: str, agent_id: str, expected_version: int, *,
+                  actor: Actor = SYSTEM) -> Run:
+        with self._denial_scope(actor, "run.start", task_id), self._tx() as conn:
+            self._check_actor(conn, actor)
+            authorize(actor.kind, "run.start")
             task = self._load_task(conn, task_id)
             if task.version != expected_version:
                 raise VersionConflict(f"task {task_id}: expected version {expected_version}, found {task.version}")
@@ -666,7 +787,7 @@ class SqliteRepository:
             active = conn.execute("SELECT COUNT(*) FROM runs WHERE state='running'").fetchone()[0]
             if active >= self.limits.max_concurrent_runs:
                 raise LimitExceeded(f"max_concurrent_runs={self.limits.max_concurrent_runs}")
-            self._apply(conn, task, Event.START, SYSTEM, ctx, reason=f"worker {worker_id}")
+            self._apply(conn, task, Event.START, SYSTEM, GuardContext(), reason=f"worker {worker_id}")
             now = self.clock.now_ms()
             attempt = task.attempt_count + 1
             conn.execute("UPDATE tasks SET attempt_count=? WHERE task_id=?", (attempt, task_id))
@@ -680,10 +801,11 @@ class SqliteRepository:
                                payload={"attempt": attempt, "agent_id": agent_id, "worker_id": worker_id,
                                         "lease_expires_at_ms": now + self.limits.lease_ttl_ms})
             return self._row_to_run(conn.execute("SELECT * FROM runs WHERE run_id=?", (run_id,)).fetchone())
-
-    def heartbeat(self, run_id: str, worker_id: str) -> bool:
+    def heartbeat(self, run_id: str, worker_id: str, *, actor: Actor = SYSTEM) -> bool:
         """Extend the lease. False => lease lost (expired, taken over, or run ended): stop and discard."""
-        with self._tx() as conn:
+        with self._denial_scope(actor, "run.heartbeat"), self._tx() as conn:
+            self._check_actor(conn, actor)
+            authorize(actor.kind, "run.heartbeat")
             now = self.clock.now_ms()
             cur = conn.execute(
                 "UPDATE runs SET heartbeat_at_ms=?, lease_expires_at_ms=? "
@@ -691,14 +813,16 @@ class SqliteRepository:
                 (now, now + self.limits.lease_ttl_ms, run_id, worker_id, now),
             )
             return cur.rowcount == 1
-
     def complete_run(
         self, run_id: str, worker_id: str, outcome: RunState, *, retryable: bool = False,
-        verifier_passed: bool = False, error: ErrorRecord | None = None,
+        verifier_passed: bool = False, error: ErrorRecord | None = None, usage: ResourceUsage | None = None,
+        actor: Actor = SYSTEM,
     ) -> TaskRecord:
         if outcome not in (RunState.SUCCEEDED, RunState.FAILED, RunState.TIMED_OUT):
             raise ValueError("outcome must be succeeded, failed or timed_out")
-        with self._tx() as conn:
+        with self._denial_scope(actor, "run.complete"), self._tx() as conn:
+            self._check_actor(conn, actor)
+            authorize(actor.kind, "run.complete")
             now = self.clock.now_ms()
             r = conn.execute("SELECT * FROM runs WHERE run_id=?", (run_id,)).fetchone()
             if r is None:
@@ -708,22 +832,30 @@ class SqliteRepository:
             task = self._load_task(conn, r["task_id"])
             if task.state is not TaskState.RUNNING:
                 raise LeaseLost(f"task {task.task_id} is no longer running")
-            if outcome is RunState.SUCCEEDED:
+            if outcome is RunState.SUCCEEDED:  # settles inside _apply
                 return self._apply(conn, task, Event.FINISH, SYSTEM, GuardContext(verifier_passed=verifier_passed),
-                                   reason="run succeeded", error=error, run_end=RunState.SUCCEEDED)
+                                   reason="run succeeded", error=error, run_end=RunState.SUCCEEDED, usage=usage)
+            # failure: settle FIRST so the retry reservation sees the freed budget
+            self._close_reservation(conn, task, task.attempt_count, run_id=run_id, settle=True, usage=usage)
             ctx = GuardContext(error_retryable=retryable)
-            can_retry = run_guard("retry_allowed", self._guard_input(conn, task, SYSTEM, ctx)) is None
             end = RunState.TIMED_OUT if outcome is RunState.TIMED_OUT else RunState.FAILED
-            if can_retry:
-                return self._apply(conn, task, Event.RETRY, SYSTEM, ctx, reason="retryable failure", error=error, run_end=end)
+            if run_guard("retry_allowed", self._guard_input(conn, task, SYSTEM, ctx)) is None:
+                res = self._reserve(conn, task)
+                if res.ok:
+                    return self._apply(conn, task, Event.RETRY, SYSTEM, ctx, reason="retryable failure", error=error, run_end=end)
+                return self._apply(conn, task, Event.BLOCK, SYSTEM, GuardContext(block_reason=BlockReason.BUDGET_INSUFFICIENT),
+                                   reason=f"retry blocked: {res.reason}", error=error, run_end=end)
             ev = Event.TIMEOUT if outcome is RunState.TIMED_OUT else Event.FAIL
             return self._apply(conn, task, ev, SYSTEM, ctx, reason="non-retryable failure", error=error, run_end=end)
+    def recover_leases(self, current_worker_id: str | None = None, *, actor: Actor = SYSTEM) -> RecoveryReport:
+        """Deterministic recovery (ordered by run_seq) of runs whose lease expired, or whose owner is not `current_worker_id`.
 
-    def recover_leases(self, current_worker_id: str | None = None) -> RecoveryReport:
-        """Deterministic recovery of runs whose lease expired (or whose owner is not `current_worker_id`).
-
-        Side-effectful tasks are NEVER re-run automatically: they go to blocked(crash_recovery_decision).
+        The abandoned run settles at WORST CASE. Side-effectful tasks are NEVER re-run automatically: they go to
+        blocked(crash_recovery_decision). Other tasks are requeued only if a fresh reservation for the next attempt succeeds.
         """
+        with self._denial_scope(actor, "run.recover"):
+            self._check_actor(self._read(), actor)
+            authorize(actor.kind, "run.recover")
         now = self.clock.now_ms()
         ids = [r[0] for r in self._read().execute(
             "SELECT run_id FROM runs WHERE state='running' AND (lease_expires_at_ms<=? OR (? IS NOT NULL AND lease_owner<>?)) "
@@ -736,23 +868,33 @@ class SqliteRepository:
                     continue
                 now = self.clock.now_ms()
                 task = self._load_task(conn, r["task_id"])
-                err = ErrorRecord(ts_ms=now, attempt=task.attempt_count, error_class="crash_recovery",
-                                  retryable=task.side_effect_class not in SIDE_EFFECTFUL,
+                side = self._effective_side_effectful(task)
+                err = ErrorRecord(ts_ms=now, attempt=task.attempt_count, error_class="crash_recovery", retryable=not side,
                                   detail=f"lease of worker {r['lease_owner']} expired or owner is dead")
                 if task.state is not TaskState.RUNNING:
                     conn.execute("UPDATE runs SET state='abandoned', ended_at_ms=? WHERE run_id=?", (now, run_id))
                     continue
-                if task.side_effect_class in SIDE_EFFECTFUL:
+                self._close_reservation(conn, task, task.attempt_count, run_id=run_id, settle=True, usage=None)  # worst case
+                if side:
                     self._apply(conn, task, Event.BLOCK, SYSTEM, GuardContext(block_reason=BlockReason.CRASH_RECOVERY_DECISION),
                                 reason="side-effectful task: human decision required", error=err, run_end=RunState.ABANDONED)
                     act = RecoveryAction(run_id, task.task_id, "blocked", "side-effectful; never auto-rerun")
                 else:
                     ctx = GuardContext(error_retryable=True)
                     if run_guard("retry_allowed", self._guard_input(conn, task, SYSTEM, ctx)) is None:
-                        self._apply(conn, task, Event.RETRY, SYSTEM, ctx, reason="lease expired; requeued", error=err, run_end=RunState.ABANDONED)
-                        act = RecoveryAction(run_id, task.task_id, "requeued", "retry allowed")
+                        res = self._reserve(conn, task)
+                        if res.ok:
+                            self._apply(conn, task, Event.RETRY, SYSTEM, ctx, reason="lease expired; requeued", error=err,
+                                        run_end=RunState.ABANDONED)
+                            act = RecoveryAction(run_id, task.task_id, "requeued", "retry allowed")
+                        else:
+                            self._apply(conn, task, Event.BLOCK, SYSTEM,
+                                        GuardContext(block_reason=BlockReason.BUDGET_INSUFFICIENT),
+                                        reason=f"requeue blocked: {res.reason}", error=err, run_end=RunState.ABANDONED)
+                            act = RecoveryAction(run_id, task.task_id, "blocked", f"budget: {res.reason}")
                     else:
-                        self._apply(conn, task, Event.FAIL, SYSTEM, ctx, reason="lease expired; retries exhausted", error=err, run_end=RunState.ABANDONED)
+                        self._apply(conn, task, Event.FAIL, SYSTEM, ctx, reason="lease expired; retries exhausted", error=err,
+                                    run_end=RunState.ABANDONED)
                         act = RecoveryAction(run_id, task.task_id, "failed", "retries exhausted")
                 actions.append(act)
         with self._tx() as conn:
@@ -760,16 +902,40 @@ class SqliteRepository:
                 "abandoned": len(actions), "requeued": sum(a.action == "requeued" for a in actions),
                 "blocked": sum(a.action == "blocked" for a in actions), "failed": sum(a.action == "failed" for a in actions)})
         return RecoveryReport(actions)
-
     # ------------------------------------------------------------ artifacts / ledger (minimal in M1)
 
     def add_artifact(self, artifact: Artifact, actor: Actor) -> Artifact:
-        with self._tx() as conn:
+        """Register an artifact. Trust level and class/role pairing are ENFORCED here, not trusted from the caller."""
+        with self._denial_scope(actor, "artifact.register"), self._tx() as conn:
             self._check_actor(conn, actor)
+            authorize(actor.kind, "artifact.register")
+            cls, trust = artifact.artifact_class, artifact.trust_level
             for pid in artifact.parent_artifact_ids:
                 if conn.execute("SELECT 1 FROM artifacts WHERE artifact_id=?", (pid,)).fetchone() is None:
                     raise NotFound(f"parent artifact {pid!r} must be registered first")
-            stored = artifact.model_copy(update={"provenance_hash": provenance_hash(artifact)})
+            if artifact.producer_run_id is not None:
+                r = conn.execute("SELECT t.assigned_role, t.contract_json FROM runs r JOIN tasks t ON t.task_id=r.task_id "
+                                 "WHERE r.run_id=?", (artifact.producer_run_id,)).fetchone()
+                if r is None:
+                    raise NotFound(f"producer run {artifact.producer_run_id!r}")
+                role = r["assigned_role"]
+                want = {"chatgpt_work": ArtifactClass.EXTERNAL_HANDOFF, "ai_scientist": ArtifactClass.SCIENTIST_OUTPUT}.get(role)
+                if want is not None and cls is not want:
+                    raise GuardFailed("provenance", f"{role} output must be class {want.value}")
+                if want is None and cls in (ArtifactClass.EXTERNAL_HANDOFF, ArtifactClass.SCIENTIST_OUTPUT, ArtifactClass.FINAL_EVALUATION):
+                    raise GuardFailed("provenance", f"{role} may not produce class {cls.value}")
+                contract = TaskContract.model_validate_json(r["contract_json"])
+                allowed = {ref.artifact_id for ref in contract.input_artifact_refs}
+                allowed |= {x[0] for x in conn.execute("SELECT artifact_id FROM artifacts WHERE producer_run_id=?", (artifact.producer_run_id,))}
+                extra = set(artifact.parent_artifact_ids) - allowed
+                if extra:
+                    raise GuardFailed("provenance", f"parents {sorted(extra)} are neither pinned inputs nor outputs of this run")
+            # Untrusted by construction: whatever the caller claims, these classes are never stored as trusted.
+            if cls is ArtifactClass.EXTERNAL_HANDOFF and trust not in (TrustLevel.UNTRUSTED, TrustLevel.QUARANTINED):
+                trust = TrustLevel.UNTRUSTED
+            if cls is ArtifactClass.SCIENTIST_OUTPUT:
+                trust = TrustLevel.QUARANTINED
+            stored = artifact.model_copy(update={"provenance_hash": provenance_hash(artifact), "trust_level": trust})
             conn.execute(
                 "INSERT INTO artifacts(artifact_id,sha256,size_bytes,media_type,artifact_class,logical_name,storage_uri,"
                 "producer_run_id,producer_principal_id,trust_level,is_mock,provenance_hash,created_at_ms) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
@@ -781,10 +947,52 @@ class SqliteRepository:
                 conn.execute("INSERT INTO artifact_lineage(child_artifact_id,parent_artifact_id,relation) VALUES(?,?,'derived_from')",
                              (stored.artifact_id, pid))
             self._append_event(conn, "artifact.registered", actor, run_id=stored.producer_run_id,
-                               payload={"artifact_id": stored.artifact_id, "sha256": stored.sha256,
-                                        "provenance_hash": stored.provenance_hash, "parents": sorted(stored.parent_artifact_ids)})
+                               payload={"artifact_id": stored.artifact_id, "sha256": stored.sha256, "class": cls.value,
+                                        "trust_level": trust.value, "provenance_hash": stored.provenance_hash,
+                                        "parents": sorted(stored.parent_artifact_ids)})
             return stored
 
+    def authorize_artifact_read(self, actor: Actor, artifact_id: str, for_task_id: str | None = None) -> Artifact:
+        """Decide (from the permissions matrix) whether `actor` may read the artifact's bytes. Denials are audited."""
+        art = self.get_artifact(artifact_id)
+        action = f"artifact.read:{art.artifact_class.value}"
+        with self._denial_scope(actor, action, for_task_id):
+            conn = self._read()
+            self._check_actor(conn, actor)
+            pinned = False
+            if for_task_id is not None:
+                task = self._load_task(conn, for_task_id)
+                pinned = artifact_id in {ref.artifact_id for ref in task.contract.input_artifact_refs}
+            own = False
+            if art.producer_run_id is not None:
+                r = conn.execute("SELECT agent_id FROM runs WHERE run_id=?", (art.producer_run_id,)).fetchone()
+                own = r is not None and r["agent_id"] == actor.id
+            if not may_read_artifact(actor.kind, art.artifact_class.value, pinned_or_own=pinned or own,
+                                     quarantined=art.trust_level is TrustLevel.QUARANTINED):
+                raise NotAuthorized(f"{actor.kind.value} may not read {art.artifact_class.value} artifact {artifact_id}")
+        return art
+
+    def release_artifact(self, artifact_id: str, actor: Actor) -> Artifact:
+        """Human releases a quarantined artifact to `untrusted` (never directly to trusted)."""
+        with self._denial_scope(actor, "artifact.release"), self._tx() as conn:
+            self._check_actor(conn, actor)
+            authorize(actor.kind, "artifact.release")
+            cur = conn.execute("UPDATE artifacts SET trust_level='untrusted' WHERE artifact_id=? AND trust_level='quarantined'",
+                               (artifact_id,))
+            if cur.rowcount != 1:
+                raise GuardFailed("release_artifact", "artifact is not quarantined")
+            self._append_event(conn, "artifact.released", actor, payload={"artifact_id": artifact_id, "to": "untrusted"})
+        return self.get_artifact(artifact_id)
+
+    def record_system_event(self, event_type: str, payload: dict[str, Any], task_id: str | None = None,
+                            actor: Actor = SYSTEM) -> AuditEvent:
+        """Audited errors raised outside a state change (e.g. routing failures). Event types are allow-listed."""
+        if event_type not in {"agent.route_failed", "worker.error"}:
+            raise ValueError(f"event type {event_type!r} is not allowed here")
+        with self._denial_scope(actor, "audit.append_system_event", task_id), self._tx() as conn:
+            self._check_actor(conn, actor)
+            authorize(actor.kind, "audit.append_system_event")
+            return self._append_event(conn, event_type, actor, task_id=task_id, payload=payload)
     def get_artifact(self, artifact_id: str) -> Artifact:
         r = self._read().execute("SELECT * FROM artifacts WHERE artifact_id=?", (artifact_id,)).fetchone()
         if r is None:
@@ -799,35 +1007,161 @@ class SqliteRepository:
             created_at_ms=r["created_at_ms"], provenance_hash=r["provenance_hash"],
         )
 
-    def append_ledger_entry(self, entry: BudgetLedgerEntry, actor: Actor) -> BudgetLedgerEntry:
-        with self._tx() as conn:
+    # ------------------------------------------------------------ budget API (human gates, queueing, status)
+
+    def reserve_budget(self, task_id: str, expected_version: int, *, actor: Actor = SYSTEM) -> budget_sql.ReserveOutcome:
+        """Explicit reservation in its own transaction. Prefer queue_task()/enqueue(), which reserve AND transition atomically."""
+        with self._denial_scope(actor, "budget.reserve", task_id), self._tx() as conn:
             self._check_actor(conn, actor)
-            dup = conn.execute("SELECT * FROM budget_ledger WHERE idempotency_key=?", (entry.idempotency_key,)).fetchone()
-            if dup is not None:
-                return self._row_to_ledger(dup)
-            if entry.kind in (LedgerKind.GRANT, LedgerKind.ADJUST):
-                ap = conn.execute(
-                    "SELECT a.status, p.type FROM approvals a LEFT JOIN principals p ON p.principal_id=a.decided_by WHERE a.approval_id=?",
-                    (entry.approval_id,)).fetchone()
-                if ap is None or ap["status"] != "granted" or ap["type"] != "human":
-                    raise NotAuthorized("grant/adjust requires an approval granted by a human principal")
+            authorize(actor.kind, "budget.reserve")
+            task = self._load_task(conn, task_id)
+            if task.version != expected_version:
+                raise VersionConflict(f"task {task_id}: expected version {expected_version}, found {task.version}")
+            if task.state not in (TaskState.APPROVED, TaskState.BLOCKED, TaskState.REVIEW):
+                raise GuardFailed("reserve_budget", f"cannot reserve in state {task.state.value}")
+            return self._reserve(conn, task)
+
+    def enqueue(self, task_id: str, event: Event, actor: Actor, expected_version: int,
+                ctx: GuardContext | None = None, *, reason: str | None = None) -> TaskRecord:
+        """QUEUE / UNBLOCK / REWORK: reserve budget and transition to queued in ONE BEGIN IMMEDIATE transaction.
+
+        The transition's own guard re-reads the ledger and refuses unless an open reservation row exists.
+        QUEUE with insufficient budget parks the task in blocked(budget_insufficient); UNBLOCK/REWORK raise BudgetInsufficient.
+        """
+        if event not in (Event.QUEUE, Event.UNBLOCK, Event.REWORK):
+            raise ValueError("enqueue handles QUEUE, UNBLOCK and REWORK only")
+        with self._denial_scope(actor, f"event:{event.value}", task_id), self._tx() as conn:
+            self._check_actor(conn, actor)
+            task = self._load_task(conn, task_id)
+            if task.version != expected_version:
+                raise VersionConflict(f"task {task_id}: expected version {expected_version}, found {task.version}")
+            decide(task.state, event, actor.kind)  # illegal/unauthorised events never touch the ledger
+            if task.kind is TaskKind.WORK:
+                res = self._reserve(conn, task)
+                if not res.ok:
+                    if event is Event.QUEUE:
+                        return self._apply(conn, task, Event.BLOCK, SYSTEM,
+                                           GuardContext(block_reason=BlockReason.BUDGET_INSUFFICIENT),
+                                           reason=f"queue refused: {res.reason}")
+                    raise BudgetInsufficient(res.reason or "insufficient budget")
+            return self._apply(conn, task, event, actor, ctx or GuardContext(), reason=reason)
+
+    def queue_task(self, task_id: str, expected_version: int, *, actor: Actor = SYSTEM) -> TaskRecord:
+        return self.enqueue(task_id, Event.QUEUE, actor, expected_version)
+
+    def set_budget(self, budget_id: str, scope: str, scope_ref: str, usd_micro: int, tokens: int, actor: Actor) -> None:
+        """Human sets an INITIAL base limit. Base limits are immutable afterwards; increases need approval + grant_budget()."""
+        with self._denial_scope(actor, "budget.set"), self._tx() as conn:
+            self._check_actor(conn, actor)
+            authorize(actor.kind, "budget.set")
+            if conn.execute("SELECT 1 FROM budgets WHERE budget_id=?", (budget_id,)).fetchone() is not None:
+                raise GuardFailed("set_budget", "budget already exists; increases require a human-approved grant")
+            budget_sql.ensure_budget(conn, budget_id, scope, scope_ref, usd_micro, tokens, actor.id, self.clock.now_ms())
+            self._append_event(conn, "budget.set", actor, payload={"budget_id": budget_id, "usd_micro": usd_micro, "tokens": tokens})
+
+    def request_budget_increase(self, task_id: str, budget_id: str, usd_micro: int, tokens: int, requested_by: Actor) -> Approval:
+        """File a budget_increase approval bound to the task's CURRENT contract_version + contract_sha256."""
+        with self._denial_scope(requested_by, "budget.request_increase", task_id), self._tx() as conn:
+            self._check_actor(conn, requested_by)
+            authorize(requested_by.kind, "budget.request_increase")
+            task = self._load_task(conn, task_id)
+            if task.state in TERMINAL_STATES:
+                raise GuardFailed("budget_increase", "task is terminal")
+            if usd_micro < 0 or tokens < 0 or (usd_micro == 0 and tokens == 0):
+                raise GuardFailed("budget_increase", "amount must be positive")
+            if budget_id.split(":", 1)[0] not in ("task", "root", "global", "role"):
+                raise GuardFailed("budget_increase", f"unknown budget {budget_id!r}")
+            row = conn.execute(
+                "SELECT * FROM approvals WHERE task_id=? AND approval_type='budget_increase' AND task_version=? AND budget_id=? "
+                "AND status IN ('pending','granted')", (task_id, task.contract_version, budget_id)).fetchone()
+            if row is not None:
+                return self._row_to_approval(row)
+            now = self.clock.now_ms()
+            aid = self._new_id()
             conn.execute(
-                "INSERT INTO budget_ledger(entry_id,budget_id,task_id,run_id,kind,usd_micro,tokens,wall_s,approval_id,idempotency_key,created_at_ms)"
-                " VALUES(?,?,?,?,?,?,?,?,?,?,?)",
-                (entry.entry_id, entry.budget_id, entry.task_id, entry.run_id, entry.kind.value, entry.usd_micro,
-                 entry.tokens, entry.wall_s, entry.approval_id, entry.idempotency_key, entry.created_at_ms),
-            )
-            self._append_event(conn, "ledger.appended", actor, task_id=entry.task_id, run_id=entry.run_id,
-                               payload={"entry_id": entry.entry_id, "kind": entry.kind.value, "usd_micro": entry.usd_micro,
-                                        "budget_id": entry.budget_id})
-            return entry
+                "INSERT INTO approvals(approval_id,task_id,task_version,contract_sha256,approval_type,status,requested_by,"
+                "requested_at_ms,expires_at_ms,budget_id,amount_usd_micro,amount_tokens) VALUES(?,?,?,?,'budget_increase','pending',?,?,?,?,?,?)",
+                (aid, task_id, task.contract_version, task.contract_sha256, requested_by.id, now,
+                 now + self.limits.approval_ttl_ms, budget_id, usd_micro, tokens))
+            self._append_event(conn, "approval.requested", requested_by, task_id=task_id, payload={
+                "approval_id": aid, "approval_type": "budget_increase", "budget_id": budget_id, "usd_micro": usd_micro,
+                "tokens": tokens, "task_version": task.contract_version, "contract_sha256": task.contract_sha256})
+            return self._row_to_approval(conn.execute("SELECT * FROM approvals WHERE approval_id=?", (aid,)).fetchone())
+
+    def grant_budget(self, approval_id: str, *, actor: Actor = SYSTEM) -> BudgetLedgerEntry:
+        """Apply a HUMAN-granted budget_increase approval to the ledger. Single use; refused if the contract changed since."""
+        deferred: Exception | None = None
+        with self._denial_scope(actor, "budget.grant"), self._tx() as conn:
+            self._check_actor(conn, actor)
+            authorize(actor.kind, "budget.grant")
+            row = conn.execute("SELECT * FROM approvals WHERE approval_id=?", (approval_id,)).fetchone()
+            if row is None:
+                raise NotFound(f"approval {approval_id!r}")
+            if row["approval_type"] != "budget_increase":
+                raise GuardFailed("grant_budget", "not a budget_increase approval")
+            dup = conn.execute("SELECT * FROM budget_ledger WHERE idempotency_key=?", (f"grant:{approval_id}",)).fetchone()
+            if dup is not None:
+                return self._row_to_ledger(dup)  # single use: replay returns the same entry, never a second grant
+            human = conn.execute("SELECT 1 FROM principals WHERE principal_id=? AND type='human' AND enabled=1",
+                                 (row["decided_by"],)).fetchone()
+            if row["status"] != "granted" or human is None:
+                raise NotAuthorized("budget grant requires an approval granted by a human principal")
+            task = self._load_task(conn, row["task_id"])
+            if row["task_version"] != task.contract_version or row["contract_sha256"] != task.contract_sha256:
+                conn.execute("UPDATE approvals SET status='invalidated' WHERE approval_id=?", (approval_id,))
+                self._append_event(conn, "approval.invalidated", actor, task_id=task.task_id,
+                                   payload={"approval_id": approval_id, "reason": "stale binding at grant time"})
+                deferred = StaleApproval("budget approval is bound to an older contract version/hash")
+            else:
+                bid = row["budget_id"]
+                kind, _, ref = bid.partition(":")
+                now = self.clock.now_ms()
+                if kind == "root":
+                    budget_sql.ensure_budget(conn, bid, "root", ref, self.limits.default_root_usd_micro, self.limits.default_root_tokens, "system", now)
+                elif kind == "global":
+                    budget_sql.ensure_budget(conn, bid, "global_daily", ref, self.limits.default_global_daily_usd_micro, self.limits.default_global_daily_tokens, "system", now)
+                elif kind == "role":
+                    budget_sql.ensure_budget(conn, bid, "role", ref, self.limits.real_adapter_default_usd_micro, self.limits.real_adapter_default_tokens, "system", now)
+                entry_id = self._new_id()
+                conn.execute(
+                    "INSERT INTO budget_ledger(entry_id,budget_id,task_id,run_id,kind,usd_micro,tokens,wall_s,approval_id,"
+                    "idempotency_key,created_at_ms,attempt,reserve_ref) VALUES(?,?,?,NULL,'grant',?,?,0,?,?,?,NULL,NULL)",
+                    (entry_id, bid, task.task_id, row["amount_usd_micro"], row["amount_tokens"], approval_id,
+                     f"grant:{approval_id}", now))
+                budget_sql.reactivate_if_within_limit(conn, bid)
+                self._append_event(conn, "budget.granted", actor, task_id=task.task_id, payload={
+                    "approval_id": approval_id, "budget_id": bid, "usd_micro": row["amount_usd_micro"],
+                    "tokens": row["amount_tokens"], "decided_by": row["decided_by"]})
+            out = conn.execute("SELECT * FROM budget_ledger WHERE idempotency_key=?", (f"grant:{approval_id}",)).fetchone()
+        if deferred is not None:
+            raise deferred
+        return self._row_to_ledger(out)
+
+    def budget_status(self, budget_id: str) -> BudgetStatus:
+        conn = self._read()
+        kind, _, ref = budget_id.partition(":")
+        if kind == "task":
+            t = self._load_task(conn, ref)
+            gu, gt = budget_sql.grants(conn, budget_id)
+            lim_u, lim_t = budget_sql.task_limits(t, gu, gt)
+            state = "active"
+        else:
+            row = conn.execute("SELECT * FROM budgets WHERE budget_id=?", (budget_id,)).fetchone()
+            if row is None:
+                raise NotFound(f"budget {budget_id!r}")
+            lim_u, lim_t = budget_sql.effective_limits(conn, row)
+            state = row["state"]
+        u, t_used = budget_sql.usage(conn, budget_id)
+        return BudgetStatus(budget_id, lim_u, lim_t, u, t_used, state)
+
 
     @staticmethod
     def _row_to_ledger(r: sqlite3.Row) -> BudgetLedgerEntry:
         return BudgetLedgerEntry(
             entry_id=r["entry_id"], budget_id=r["budget_id"], task_id=r["task_id"], run_id=r["run_id"],
             kind=LedgerKind(r["kind"]), usd_micro=r["usd_micro"], tokens=r["tokens"], wall_s=r["wall_s"],
-            approval_id=r["approval_id"], idempotency_key=r["idempotency_key"], created_at_ms=r["created_at_ms"],
+            approval_id=r["approval_id"], attempt=r["attempt"], reserve_ref=r["reserve_ref"],
+            idempotency_key=r["idempotency_key"], created_at_ms=r["created_at_ms"],
         )
 
     def list_ledger(self, budget_id: str | None = None) -> list[BudgetLedgerEntry]:

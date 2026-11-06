@@ -48,8 +48,8 @@ def test_planted_secret_never_stored_anywhere(open_repo, db_path):
         ap = repo.request_approval(t.task_id, req.type, SYSTEM)
         repo.decide_approval(ap.approval_id, True, HUMAN, f"ok, key is {FAKE_ANTHROPIC}")
     t = repo.transition(t.task_id, Event.APPROVE, HUMAN, t.version)
-    t = repo.transition(t.task_id, Event.QUEUE, SYSTEM, t.version)
-    run = repo.start_run(t.task_id, "w1", EXECUTOR.id, t.version, GuardContext(budget_reserved=True))
+    t = repo.queue_task(t.task_id, t.version)
+    run = repo.start_run(t.task_id, "w1", EXECUTOR.id, t.version)
     err = ErrorRecord(ts_ms=1, attempt=1, error_class="adapter_error", retryable=True,
                       detail=f"HTTP 401 with Authorization: Bearer {FAKE_ANTHROPIC} and {FAKE_ENV_SECRET}")
     repo.complete_run(run.run_id, "w1", RunState.FAILED, retryable=True, error=err)

@@ -44,6 +44,6 @@ def test_detects_unhashed_lock_entry():
 def test_venv_is_not_tracked_by_git():
     import subprocess
 
-    out = subprocess.run(["git", "ls-files", ".venv"], cwd=ROOT, capture_output=True, text=True, check=True).stdout
+    out = subprocess.run(["git", "-c", f"safe.directory={ROOT}", "ls-files", ".venv"], cwd=ROOT, capture_output=True, text=True, check=True).stdout
     assert out.strip() == ""
     assert ".venv/" in (ROOT / ".gitignore").read_text()

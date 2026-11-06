@@ -26,46 +26,46 @@ class Transition:
     event: Event
     to_state: TaskState
     actors: frozenset[ActorKind]
-    guard: str | None = None
+    guards: tuple[str, ...] = ()
 
 
-def _t(tid: str, f: TaskState, e: Event, t: TaskState, actors: set[ActorKind], guard: str | None = None) -> Transition:
-    return Transition(tid, f, e, t, frozenset(actors), guard)
+def _t(tid: str, f: TaskState, e: Event, t: TaskState, actors: set[ActorKind], *guards: str) -> Transition:
+    return Transition(tid, f, e, t, frozenset(actors), tuple(guards))
 
 
-_H, _SY, _D, _P = A.HUMAN, A.SYSTEM, A.DIRECTOR, A.PLANNER
+_H, _SY, _D, _P = A.HUMAN, A.SYSTEM, A.DIRECTOR, A.PLANNER  # no agent role may cancel or approve
 
 TRANSITIONS: tuple[Transition, ...] = (
     _t("T01", S.DRAFT, E.PLAN, S.PLANNED, {_P, _H}, "plan_valid"),
-    _t("T02", S.DRAFT, E.CANCEL, S.CANCELLED, {_H, _D}),
+    _t("T02", S.DRAFT, E.CANCEL, S.CANCELLED, {_H}),
     _t("T03", S.PLANNED, E.REQUIRE_APPROVAL, S.AWAITING_APPROVAL, {_SY}, "needs_approval"),
     _t("T04", S.PLANNED, E.AUTO_APPROVE, S.APPROVED, {_SY}, "auto_approvable"),
-    _t("T05", S.PLANNED, E.CANCEL, S.CANCELLED, {_H, _D}),
+    _t("T05", S.PLANNED, E.CANCEL, S.CANCELLED, {_H}),
     _t("T06", S.AWAITING_APPROVAL, E.APPROVE, S.APPROVED, {_H}, "approvals_valid"),
     _t("T07", S.AWAITING_APPROVAL, E.REQUEST_CHANGES, S.DRAFT, {_H}),
     _t("T08", S.AWAITING_APPROVAL, E.DENY, S.CANCELLED, {_H}),
-    _t("T08b", S.AWAITING_APPROVAL, E.CANCEL, S.CANCELLED, {_H, _D}),
+    _t("T08b", S.AWAITING_APPROVAL, E.CANCEL, S.CANCELLED, {_H}),
     _t("T09", S.AWAITING_APPROVAL, E.EXPIRE, S.TIMED_OUT, {_SY}, "approval_expired"),
-    _t("T10", S.APPROVED, E.QUEUE, S.QUEUED, {_SY}, "queue_ok"),
+    _t("T10", S.APPROVED, E.QUEUE, S.QUEUED, {_SY}, "queue_ok", "reservation_held"),
     _t("T11", S.APPROVED, E.REAPPROVE, S.AWAITING_APPROVAL, {_SY}, "approvals_stale"),
-    _t("T12", S.APPROVED, E.CANCEL, S.CANCELLED, {_H, _D}),
+    _t("T12", S.APPROVED, E.CANCEL, S.CANCELLED, {_H}),
     _t("T13", S.APPROVED, E.BLOCK, S.BLOCKED, {_SY}, "block_reason"),
-    _t("T14", S.QUEUED, E.START, S.RUNNING, {_SY}, "start_ok"),
+    _t("T14", S.QUEUED, E.START, S.RUNNING, {_SY}, "start_ok", "reservation_held"),
     _t("T15", S.QUEUED, E.BLOCK, S.BLOCKED, {_SY}, "block_reason"),
-    _t("T16", S.QUEUED, E.CANCEL, S.CANCELLED, {_H, _D}),
+    _t("T16", S.QUEUED, E.CANCEL, S.CANCELLED, {_H}),
     _t("T17", S.RUNNING, E.FINISH, S.REVIEW, {_SY}, "finish_ok"),
-    _t("T18", S.RUNNING, E.RETRY, S.QUEUED, {_SY}, "retry_allowed"),
+    _t("T18", S.RUNNING, E.RETRY, S.QUEUED, {_SY}, "retry_allowed", "reservation_held"),
     _t("T19", S.RUNNING, E.FAIL, S.FAILED, {_SY}),
     _t("T20", S.RUNNING, E.TIMEOUT, S.TIMED_OUT, {_SY}),
     _t("T21", S.RUNNING, E.BLOCK, S.BLOCKED, {_SY}, "block_reason"),
-    _t("T22", S.RUNNING, E.CANCEL, S.CANCELLED, {_H, _D}),
+    _t("T22", S.RUNNING, E.CANCEL, S.CANCELLED, {_H}),
     _t("T23", S.REVIEW, E.ACCEPT, S.COMPLETED, {_D, _H}, "reviewer_ok"),
-    _t("T24", S.REVIEW, E.REWORK, S.QUEUED, {_D, _H}, "rework_allowed"),
+    _t("T24", S.REVIEW, E.REWORK, S.QUEUED, {_D, _H}, "rework_allowed", "reservation_held"),
     _t("T25", S.REVIEW, E.REJECT, S.FAILED, {_D, _H}, "reviewer_ok"),
     _t("T26", S.REVIEW, E.CANCEL, S.CANCELLED, {_H}),
     _t("T27", S.REVIEW, E.REVIEW_TIMEOUT, S.TIMED_OUT, {_SY}, "review_ttl"),
-    _t("T28", S.BLOCKED, E.UNBLOCK, S.QUEUED, {_SY, _H}, "unblock_ok"),
-    _t("T29", S.BLOCKED, E.CANCEL, S.CANCELLED, {_H, _D}),
+    _t("T28", S.BLOCKED, E.UNBLOCK, S.QUEUED, {_SY, _H}, "unblock_ok", "reservation_held"),
+    _t("T29", S.BLOCKED, E.CANCEL, S.CANCELLED, {_H}),
     _t("T30", S.BLOCKED, E.BLOCK_TIMEOUT, S.TIMED_OUT, {_SY}, "blocked_ttl"),
     # Parent cancellation fans out to every non-terminal descendant (system actor only).
     *(
@@ -119,4 +119,4 @@ def reachable_from(start: TaskState) -> set[TaskState]:
 
 
 def guard_names() -> set[str]:
-    return {t.guard for t in TRANSITIONS if t.guard}
+    return {g for t in TRANSITIONS for g in t.guards}

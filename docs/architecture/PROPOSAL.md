@@ -5,6 +5,8 @@
 - Scope of this document: environment inspection and design only. No implementation code, no installs, no external API calls, no containers, no GPU/training work were performed or are authorised by this document.
 - Codename used below: `airos` (Python package), "control plane" = the single FastAPI process that owns state.
 
+**M2 amendments (see `M2-NOTES.md`):** agents cannot cancel (human-only); reservation precedes `queued`; per-task limit = cap x attempts; permissions matrix is `src/airos/security/permissions.json`.
+
 **Amendments (2026-11-06, human review "approved with changes"):** see ADR-0009 (approval binding to task version + contract hash), the revised §5.3 anchoring, §7 operator-token authentication, §11.2 Q6 decision, §4.3 concurrency/Clock notes and §11.4 untrusted-input rule. Where this text and an ADR disagree, the newer ADR wins.
 
 Conventions: **MUST / MUST NOT** are normative and each is meant to be testable. Every numeric default is a *proposed default*, configurable in `config/limits.toml` unless marked **HARD** (not configurable without a code change and a new ADR). Open questions are collected in §15.2; nothing ambiguous is silently decided.

@@ -1,0 +1,167 @@
+"""In-process scheduler/worker (ADR-0002). One `tick()` = queue approved tasks, start queued ones, run them via mock adapters.
+
+Everything that changes state goes through the repository (guards, ledger, audit). The worker holds no authority of its own.
+"""
+from __future__ import annotations
+
+import contextlib
+import uuid
+from dataclasses import dataclass, field
+
+from airos.agents.registry import AgentRegistry
+from airos.agents.runner import Runner
+from airos.artifacts import ArtifactService
+from airos.domain.guards import GuardContext
+from airos.domain.schemas import ErrorRecord, ResourceUsage, TaskKind, TaskRecord, build_agent_request
+from airos.domain.states import BlockReason, Event, RunState, TaskState
+from airos.errors import (
+    AdapterUnavailable,
+    AirosError,
+    GuardFailed,
+    IntegrityError,
+    LeaseLost,
+    LimitExceeded,
+    UnsafePath,
+    VersionConflict,
+)
+from airos.persistence.interfaces import RecoveryReport
+from airos.persistence.sqlite_repo import SYSTEM, SqliteRepository
+from airos.verifier import verify_response
+
+
+@dataclass
+class TickReport:
+    queued: list[str] = field(default_factory=list)
+    started: list[str] = field(default_factory=list)
+    blocked_unroutable: list[str] = field(default_factory=list)
+    finished_objectives: list[str] = field(default_factory=list)
+    failed_objectives: list[str] = field(default_factory=list)
+
+
+class Worker:
+    def __init__(self, repo: SqliteRepository, registry: AgentRegistry, runner: Runner, artifacts: ArtifactService,
+                 worker_id: str) -> None:
+        self.repo, self.registry, self.runner, self.artifacts, self.worker_id = repo, registry, runner, artifacts, worker_id
+        repo.set_real_roles(registry.real_roles())
+        # The side-effect rule for workspace_write tasks depends on a PROVEN property of the runner, not a declared one.
+        repo.set_runner_guarantee(self.prove_fresh_run_dirs(runner))
+
+    @staticmethod
+    def prove_fresh_run_dirs(runner: Runner) -> bool:
+        """Black-box proof (the runner's own claims are ignored): two run ids give two DISTINCT directories, a dirty
+        directory never leaks into the next one, and re-preparing an existing run id is refused."""
+        tag = uuid.uuid4().hex
+        try:
+            a = runner.prepare(f"proof-{tag}", f"proof-{tag}-a")
+            (a / "dirty").write_text("leftover")
+            b = runner.prepare(f"proof-{tag}", f"proof-{tag}-b")
+            if a.resolve() == b.resolve() or any(b.iterdir()):
+                return False
+            try:
+                again = runner.prepare(f"proof-{tag}", f"proof-{tag}-a")
+            except FileExistsError:
+                return True
+            return again.resolve() != a.resolve() and not any(again.iterdir())
+        except Exception:  # noqa: BLE001 - any failure to prove means NOT proven
+            return False
+
+    def start(self) -> RecoveryReport:
+        """Startup: recover every run owned by a dead process (deterministic, run_seq order)."""
+        return self.repo.recover_leases(self.worker_id)
+
+    def sweep_timeouts(self) -> list[str]:
+        """TTL watchdog (approval request, review, blocked). Each transition is guarded by the TTL itself, so calling
+        this early is harmless. Returns ids moved to timed_out."""
+        moved: list[str] = []
+        for state, event in ((TaskState.AWAITING_APPROVAL, Event.EXPIRE), (TaskState.REVIEW, Event.REVIEW_TIMEOUT),
+                             (TaskState.BLOCKED, Event.BLOCK_TIMEOUT)):
+            for t in self.repo.list_tasks(state):
+                try:
+                    self.repo.transition(t.task_id, event, SYSTEM, t.version, reason="ttl expired")
+                    moved.append(t.task_id)
+                except (GuardFailed, VersionConflict):
+                    continue
+        return moved
+
+    def tick(self) -> TickReport:
+        rep = TickReport()
+        self.sweep_timeouts()
+        for t in self.repo.list_tasks(TaskState.APPROVED):
+            try:
+                out = self.repo.queue_task(t.task_id, t.version)
+            except (GuardFailed, VersionConflict):
+                continue  # e.g. dependencies not complete yet
+            (rep.queued if out.state is TaskState.QUEUED else rep.blocked_unroutable).append(t.task_id)
+        for t in self.repo.list_tasks(TaskState.QUEUED):
+            if t.kind is TaskKind.OBJECTIVE:
+                self.repo.transition(t.task_id, Event.START, SYSTEM, t.version)
+                continue
+            if t.not_before_ms is not None and t.not_before_ms > self.repo.clock.now_ms():
+                continue
+            try:
+                adapter = self.registry.route(self.repo, t)
+            except AdapterUnavailable as exc:
+                self.repo.transition(t.task_id, Event.BLOCK, SYSTEM, t.version,
+                                     GuardContext(block_reason=BlockReason.ADAPTER_UNAVAILABLE), reason=str(exc))
+                rep.blocked_unroutable.append(t.task_id)
+                continue
+            try:
+                run = self.repo.start_run(t.task_id, self.worker_id, f"{t.assigned_role.value}-1", t.version)
+            except LimitExceeded:
+                break
+            rep.started.append(t.task_id)
+            self._execute(self.repo.get_task(t.task_id), run.run_id, run.attempt, run.lease_expires_at_ms, adapter)
+        all_tasks = self.repo.list_tasks()
+        for t in self.repo.list_tasks(TaskState.RUNNING):
+            if t.kind is TaskKind.OBJECTIVE:
+                kids = [k for k in all_tasks if k.parent_task_id == t.task_id]
+                if any(k.state in (TaskState.FAILED, TaskState.TIMED_OUT, TaskState.CANCELLED) for k in kids):
+                    self.repo.transition(t.task_id, Event.FAIL, SYSTEM, t.version, reason="fail_fast: a child did not complete")
+                    rep.failed_objectives.append(t.task_id)
+                    continue
+                try:
+                    self.repo.transition(t.task_id, Event.FINISH, SYSTEM, t.version)
+                    rep.finished_objectives.append(t.task_id)
+                except GuardFailed:
+                    pass  # children still in flight
+        return rep
+
+    def _fail(self, run_id: str, *, retryable: bool, error_class: str, detail: str, usage: ResourceUsage | None = None) -> None:
+        err = ErrorRecord(ts_ms=self.repo.clock.now_ms(), attempt=0, error_class=error_class,
+                          retryable=retryable, detail=detail)
+        with contextlib.suppress(LeaseLost):  # lease lost: the result is discarded, recovery owns this run now
+            self.repo.complete_run(run_id, self.worker_id, RunState.FAILED, retryable=retryable, error=err, usage=usage)
+
+    def _execute(self, task: TaskRecord, run_id: str, attempt: int, lease_expires: int, adapter) -> None:  # type: ignore[no-untyped-def]
+        workdir = self.runner.prepare(task.task_id, run_id)
+        request = build_agent_request(task_id=task.task_id, run_id=run_id, attempt=attempt, contract=task.contract,
+                                      lease_expires_at_ms=lease_expires)
+        if not self.repo.heartbeat(run_id, self.worker_id):
+            return
+        try:
+            response = adapter.execute(request, workdir)
+        except Exception as exc:  # adapter crash: transient, retried within limits
+            self._fail(run_id, retryable=True, error_class="adapter_error", detail=f"adapter raised {type(exc).__name__}: {exc}")
+            return
+        usage = response.resource_usage
+        if response.status != "succeeded":
+            self._fail(run_id, retryable=response.retryable, error_class=(response.error.error_class if response.error else "adapter_error"),
+                       detail=(response.error.detail if response.error else f"status {response.status}"), usage=usage)
+            return
+        forbidden = (self.artifacts.store.root, self.artifacts.store.eval_root)
+        verdict = verify_response(request, response, workdir, forbidden)
+        if not verdict.passed:
+            self._fail(run_id, retryable=False, error_class="schema_violation", detail="; ".join(verdict.problems), usage=usage)
+            return
+        try:
+            for p in response.produced_artifacts:
+                self.artifacts.ingest(run_dir=workdir, produced=p, run_id=run_id, task=task, artifact_id=uuid.uuid4().hex,
+                                      is_mock=adapter.is_mock)
+        except (IntegrityError, UnsafePath) as exc:
+            self._fail(run_id, retryable=False, error_class="hash_mismatch", detail=str(exc), usage=usage)
+            return
+        except AirosError as exc:
+            self._fail(run_id, retryable=False, error_class="policy", detail=str(exc), usage=usage)
+            return
+        with contextlib.suppress(LeaseLost):
+            self.repo.complete_run(run_id, self.worker_id, RunState.SUCCEEDED, verifier_passed=True, usage=usage)

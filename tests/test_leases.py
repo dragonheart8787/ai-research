@@ -58,9 +58,9 @@ def test_expired_lease_recovery_requeues_with_backoff_then_reruns(repo, clock):
     assert t.error_history[-1].error_class == "crash_recovery"
     # not_before gate: cannot restart before backoff elapsed
     with pytest.raises(GuardFailed, match="not_before"):
-        repo.start_run(t.task_id, "w2", EXECUTOR.id, t.version, GuardContext(budget_reserved=True))
+        repo.start_run(t.task_id, "w2", EXECUTOR.id, t.version)
     clock.advance(Limits().backoff_ms(1))
-    run2 = repo.start_run(t.task_id, "w2", EXECUTOR.id, t.version, GuardContext(budget_reserved=True))
+    run2 = repo.start_run(t.task_id, "w2", EXECUTOR.id, t.version)
     assert run2.attempt == 2 and run2.run_id != run_id
     assert repo.recover_leases().actions == []           # nothing else to recover; idempotent
     assert repo.verify_chain().ok
@@ -100,7 +100,7 @@ def test_side_effectful_task_is_never_auto_rerun(repo, clock):
     clock.advance(10 * LEASE)
     assert repo.recover_leases().actions == []
     assert repo.get_task(t.task_id).state is TaskState.BLOCKED
-    assert repo.transition(t.task_id, Event.UNBLOCK, HUMAN, t.version).state is TaskState.QUEUED
+    assert repo.enqueue(t.task_id, Event.UNBLOCK, HUMAN, t.version).state is TaskState.QUEUED
 
 
 def test_side_effectful_retry_event_is_rejected_by_guard_even_for_system(repo):
@@ -123,9 +123,9 @@ def test_retry_limit_then_failed(repo, clock):
     t = approve_fully(repo, t)
     attempts = 0
     while True:
-        t = repo.transition(t.task_id, Event.QUEUE, SYSTEM, t.version) if t.state is TaskState.APPROVED else t
+        t = repo.queue_task(t.task_id, t.version) if t.state is TaskState.APPROVED else t
         clock.advance(10_000_000)
-        run = repo.start_run(t.task_id, "w", EXECUTOR.id, t.version, GuardContext(budget_reserved=True))
+        run = repo.start_run(t.task_id, "w", EXECUTOR.id, t.version)
         attempts += 1
         t = repo.complete_run(run.run_id, "w", RunState.FAILED, retryable=True)
         if t.state is TaskState.FAILED:
@@ -158,20 +158,18 @@ def test_only_one_active_run_per_task_and_concurrency_cap(open_repo):
     b = repo.create_task(make_contract(), HUMAN).task
     to_running(repo, a)
     b = approve_fully(repo, b)
-    b = repo.transition(b.task_id, Event.QUEUE, SYSTEM, b.version)
+    b = repo.queue_task(b.task_id, b.version)
     with pytest.raises(LimitExceeded):
-        repo.start_run(b.task_id, "w2", EXECUTOR.id, b.version, GuardContext(budget_reserved=True))
+        repo.start_run(b.task_id, "w2", EXECUTOR.id, b.version)
 
 
-def test_start_requires_budget_reservation_and_matching_agent_role(repo):
+def test_start_requires_matching_agent_role(repo):
     t = repo.create_task(make_contract(), HUMAN).task
     t = approve_fully(repo, t)
-    t = repo.transition(t.task_id, Event.QUEUE, SYSTEM, t.version)
-    with pytest.raises(GuardFailed, match="budget"):
-        repo.start_run(t.task_id, "w", EXECUTOR.id, t.version, GuardContext())
+    t = repo.queue_task(t.task_id, t.version)
     from airos.errors import NotAuthorized
     with pytest.raises(NotAuthorized):
-        repo.start_run(t.task_id, "w", "planner-1", t.version, GuardContext(budget_reserved=True))
+        repo.start_run(t.task_id, "w", "planner-1", t.version)
 
 
 def test_timestamps_come_from_injected_clock(repo, clock):

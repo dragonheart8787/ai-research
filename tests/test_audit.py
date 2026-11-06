@@ -51,9 +51,7 @@ def test_every_state_change_has_matching_event(repo):
 def test_triggers_block_update_and_delete(repo, db_path, table):
     _populate(repo)
     if table == "budget_ledger":
-        from airos.domain.schemas import BudgetLedgerEntry
-        repo.append_ledger_entry(BudgetLedgerEntry(entry_id="e1", budget_id="b", kind="reserve", usd_micro=5,
-                                                   idempotency_key="k1", created_at_ms=1), HUMAN)
+        assert repo.list_ledger()  # _populate queued/started a task, so reservation rows exist
     raw = _raw(db_path)
     with pytest.raises(sqlite3.DatabaseError, match="append-only"):
         raw.execute(f"UPDATE {table} SET {'payload_json' if table == 'task_events' else 'usd_micro'}=" +
@@ -189,12 +187,10 @@ def test_anchor_written_on_human_approval_and_root_completion_only(repo, tmp_pat
         ts, seq, h, typ = ln.split("\t")
         assert events[int(seq)].entry_hash == h and events[int(seq)].ts_ms == int(ts)
     # complete the root task -> exactly one more anchor line
-    from airos.domain.guards import GuardContext
     from airos.domain.states import RunState
-    from airos.persistence.sqlite_repo import SYSTEM
     from tests.conftest import EXECUTOR
-    t = repo.transition(t.task_id, Event.QUEUE, SYSTEM, t.version)
-    run = repo.start_run(t.task_id, "w1", EXECUTOR.id, t.version, GuardContext(budget_reserved=True))
+    t = repo.queue_task(t.task_id, t.version)
+    run = repo.start_run(t.task_id, "w1", EXECUTOR.id, t.version)
     t = repo.complete_run(run.run_id, "w1", RunState.SUCCEEDED, verifier_passed=True)
     repo.transition(t.task_id, Event.ACCEPT, DIRECTOR, t.version)
     lines = anchor.read_text().strip().splitlines()
@@ -246,8 +242,8 @@ def test_anchor_written_on_root_objective_completion(repo, tmp_path):
     root = repo.create_task(free_contract(kind=TaskKind.OBJECTIVE, assigned_role=Role.DIRECTOR), HUMAN).task
     child = repo.create_task(make_contract(), PLANNER, root.task_id).task
     child = approve_fully(repo, child)
-    child = repo.transition(child.task_id, Event.QUEUE, SYSTEM, child.version)
-    run = repo.start_run(child.task_id, "w1", EXECUTOR.id, child.version, GuardContext(budget_reserved=True))
+    child = repo.queue_task(child.task_id, child.version)
+    run = repo.start_run(child.task_id, "w1", EXECUTOR.id, child.version)
     child = repo.complete_run(run.run_id, "w1", RunState.SUCCEEDED, verifier_passed=True)
     child = repo.transition(child.task_id, Event.ACCEPT, DIRECTOR, child.version)
     assert child.state.value == "completed"
@@ -255,8 +251,8 @@ def test_anchor_written_on_root_objective_completion(repo, tmp_path):
     n_before = len(anchor.read_text().splitlines())          # child completion is NOT a root completion
     root = repo.transition(root.task_id, Event.PLAN, PLANNER, root.version, GuardContext(plan_ok=True))
     root = repo.transition(root.task_id, Event.AUTO_APPROVE, SYSTEM, root.version)
-    root = repo.transition(root.task_id, Event.QUEUE, SYSTEM, root.version)
-    root = repo.transition(root.task_id, Event.START, SYSTEM, root.version, GuardContext(budget_reserved=True))
+    root = repo.queue_task(root.task_id, root.version)
+    root = repo.transition(root.task_id, Event.START, SYSTEM, root.version)
     root = repo.transition(root.task_id, Event.FINISH, SYSTEM, root.version)
     assert len(anchor.read_text().splitlines()) == n_before  # reaching review is not completion either
     root = repo.transition(root.task_id, Event.ACCEPT, HUMAN, root.version)

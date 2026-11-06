@@ -25,6 +25,9 @@ HUMAN2 = Actor(ActorKind.HUMAN, "human-2")
 PLANNER = Actor(ActorKind.PLANNER, "planner-1")
 DIRECTOR = Actor(ActorKind.DIRECTOR, "director-1")
 EXECUTOR = Actor(ActorKind.EXECUTOR, "executor-1")
+CGW = Actor(ActorKind.CHATGPT_WORK, "chatgpt_work-1")
+SCI = Actor(ActorKind.AI_SCIENTIST, "ai_scientist-1")
+AGENT_ACTORS = (PLANNER, DIRECTOR, EXECUTOR, CGW, SCI)
 
 _counter = itertools.count(1)
 
@@ -82,6 +85,7 @@ def open_repo(db_path: Path, clock: FakeClock, tmp_path: Path) -> Iterator[Calla
         for a, t, role in (
             (HUMAN, "human", None), (HUMAN2, "human", None),
             (PLANNER, "agent", "planner"), (DIRECTOR, "agent", "director"), (EXECUTOR, "agent", "executor"),
+            (CGW, "agent", "chatgpt_work"), (SCI, "agent", "ai_scientist"),
         ):
             r.register_principal(a.id, t, role, a.id)
         return r
@@ -108,6 +112,6 @@ def approve_fully(repo: SqliteRepository, task: TaskRecord) -> TaskRecord:
 
 def to_running(repo: SqliteRepository, task: TaskRecord, worker: str = "w1") -> tuple[TaskRecord, str]:
     t = approve_fully(repo, task)
-    t = repo.transition(t.task_id, Event.QUEUE, SYSTEM, t.version)
-    run = repo.start_run(t.task_id, worker, EXECUTOR.id, t.version, GuardContext(budget_reserved=True))
+    t = repo.queue_task(t.task_id, t.version)
+    run = repo.start_run(t.task_id, worker, EXECUTOR.id, t.version)
     return repo.get_task(t.task_id), run.run_id

@@ -12,10 +12,6 @@ class IllegalTransition(AirosError):
         self.state, self.event = state, event
 
 
-class ActorNotAllowed(AirosError):
-    def __init__(self, tid: str, actor: str) -> None:
-        super().__init__(f"actor kind {actor!r} may not trigger transition {tid}")
-        self.tid, self.actor = tid, actor
 
 
 class GuardFailed(AirosError):
@@ -34,6 +30,33 @@ class IdempotencyConflict(AirosError):
 
 class NotAuthorized(AirosError):
     """Principal missing/disabled/mismatched, or action not permitted for the actor."""
+
+
+class ActorNotAllowed(NotAuthorized):
+    """The transition table does not allow this actor kind to trigger the event."""
+
+    def __init__(self, tid: str, actor: str) -> None:
+        super().__init__(f"actor kind {actor!r} may not trigger transition {tid}")
+        self.tid, self.actor = tid, actor
+
+
+class BudgetInsufficient(GuardFailed):
+    """A reservation could not be made (task, root, global-daily or role level)."""
+
+    def __init__(self, reason: str) -> None:
+        super().__init__("budget_reservation", reason)
+
+
+class AdapterUnavailable(AirosError):
+    """Unknown role, disabled adapter, or adapter without credentials/implementation: fail closed."""
+
+
+class IntegrityError(AirosError):
+    """Stored bytes or provenance do not match their recorded hash."""
+
+
+class UnsafePath(AirosError):
+    """Path traversal, symlink, hard link, or non-regular file."""
 
 
 class NotFound(AirosError):

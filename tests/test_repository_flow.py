@@ -84,8 +84,8 @@ def test_director_must_not_review_director_output_human_required(repo):
         {"type": "cost", "reason": "x"}]), HUMAN).task
     # fast-forward via raw legal transitions
     t = approve_fully(repo, t)
-    t = repo.transition(t.task_id, Event.QUEUE, SYSTEM, t.version)
-    run = repo.start_run(t.task_id, "w1", DIRECTOR.id, t.version, GuardContext(budget_reserved=True))
+    t = repo.queue_task(t.task_id, t.version)
+    run = repo.start_run(t.task_id, "w1", DIRECTOR.id, t.version)
     from airos.domain.states import RunState
     t = repo.complete_run(run.run_id, "w1", RunState.SUCCEEDED, verifier_passed=True)
     with pytest.raises(GuardFailed):
@@ -180,18 +180,18 @@ def test_dependencies_gate_queueing_and_detect_cycles(repo):
     b = repo.get_task(b.task_id)
     b = approve_fully(repo, b)
     with pytest.raises(GuardFailed, match="dependencies"):
-        repo.transition(b.task_id, Event.QUEUE, SYSTEM, b.version)
+        repo.queue_task(b.task_id, b.version)
 
 
 def test_blocked_unblock_rules(repo):
     t = repo.create_task(make_contract(), HUMAN).task
     t = approve_fully(repo, t)
-    t = repo.transition(t.task_id, Event.QUEUE, SYSTEM, t.version)
+    t = repo.queue_task(t.task_id, t.version)
     t = repo.transition(t.task_id, Event.BLOCK, SYSTEM, t.version, GuardContext(block_reason=BlockReason.BUDGET_INSUFFICIENT))
     assert t.blocked_reason is BlockReason.BUDGET_INSUFFICIENT and t.blocked_from is TaskState.QUEUED
     with pytest.raises(GuardFailed, match="human"):
         repo.transition(t.task_id, Event.UNBLOCK, SYSTEM, t.version)
-    t = repo.transition(t.task_id, Event.UNBLOCK, HUMAN, t.version)
+    t = repo.enqueue(t.task_id, Event.UNBLOCK, HUMAN, t.version)
     assert t.state is TaskState.QUEUED and t.blocked_reason is None
 
 

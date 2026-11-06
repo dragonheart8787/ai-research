@@ -1,0 +1,221 @@
+{
+  "version": 1,
+  "actions": {
+    "approval.decide": [
+      "human"
+    ],
+    "approval.request": [
+      "human",
+      "system",
+      "director",
+      "planner"
+    ],
+    "artifact.register": [
+      "human",
+      "system"
+    ],
+    "artifact.release": [
+      "human"
+    ],
+    "audit.append_system_event": [
+      "system"
+    ],
+    "budget.grant": [
+      "human",
+      "system"
+    ],
+    "budget.request_increase": [
+      "human",
+      "system",
+      "director",
+      "planner"
+    ],
+    "budget.reserve": [
+      "system"
+    ],
+    "budget.set": [
+      "human"
+    ],
+    "event:accept": [
+      "director",
+      "human"
+    ],
+    "event:approve": [
+      "human"
+    ],
+    "event:auto_approve": [
+      "system"
+    ],
+    "event:block": [
+      "system"
+    ],
+    "event:block_timeout": [
+      "system"
+    ],
+    "event:cancel": [
+      "human"
+    ],
+    "event:cascade_cancel": [
+      "system"
+    ],
+    "event:deny": [
+      "human"
+    ],
+    "event:expire": [
+      "system"
+    ],
+    "event:fail": [
+      "system"
+    ],
+    "event:finish": [
+      "system"
+    ],
+    "event:plan": [
+      "human",
+      "planner"
+    ],
+    "event:queue": [
+      "system"
+    ],
+    "event:reapprove": [
+      "system"
+    ],
+    "event:reject": [
+      "director",
+      "human"
+    ],
+    "event:request_changes": [
+      "human"
+    ],
+    "event:require_approval": [
+      "system"
+    ],
+    "event:retry": [
+      "system"
+    ],
+    "event:review_timeout": [
+      "system"
+    ],
+    "event:rework": [
+      "director",
+      "human"
+    ],
+    "event:start": [
+      "system"
+    ],
+    "event:timeout": [
+      "system"
+    ],
+    "event:unblock": [
+      "human",
+      "system"
+    ],
+    "run.complete": [
+      "system"
+    ],
+    "run.heartbeat": [
+      "system"
+    ],
+    "run.recover": [
+      "system"
+    ],
+    "run.start": [
+      "system"
+    ],
+    "task.add_dependency": [
+      "human",
+      "planner"
+    ],
+    "task.amend": [
+      "human",
+      "planner"
+    ],
+    "task.create_child": [
+      "human",
+      "planner"
+    ],
+    "task.create_root": [
+      "human"
+    ],
+    "task.create_root_as_director": [
+      "director"
+    ]
+  },
+  "artifact_read": {
+    "request": {
+      "always": [
+        "human",
+        "system",
+        "director",
+        "planner"
+      ],
+      "inputs_or_own": [
+        "executor",
+        "chatgpt_work",
+        "ai_scientist"
+      ]
+    },
+    "plan": {
+      "always": [
+        "human",
+        "system",
+        "director",
+        "planner"
+      ],
+      "inputs_or_own": [
+        "executor",
+        "chatgpt_work"
+      ]
+    },
+    "work_product": {
+      "always": [
+        "human",
+        "system",
+        "director"
+      ],
+      "inputs_or_own": [
+        "planner",
+        "executor",
+        "chatgpt_work"
+      ]
+    },
+    "external_handoff": {
+      "always": [
+        "human",
+        "system",
+        "director"
+      ],
+      "inputs_or_own": [
+        "planner",
+        "executor",
+        "chatgpt_work"
+      ]
+    },
+    "scientist_output": {
+      "always": [
+        "human",
+        "system",
+        "director"
+      ],
+      "inputs_or_own": [
+        "ai_scientist"
+      ]
+    },
+    "eval_result": {
+      "always": [
+        "human",
+        "system",
+        "director",
+        "planner"
+      ],
+      "inputs_or_own": []
+    },
+    "final_evaluation": {
+      "always": [
+        "human",
+        "system"
+      ],
+      "inputs_or_own": []
+    }
+  }
+}
