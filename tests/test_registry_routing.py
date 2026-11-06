@@ -13,7 +13,7 @@ from airos.domain.schemas import Role
 from airos.domain.states import BlockReason, Event, TaskState
 from airos.errors import AdapterUnavailable
 from airos.persistence.sqlite_repo import SYSTEM
-from tests.conftest import HUMAN, approve_fully, make_contract
+from tests.conftest import HUMAN, TEST_PRICES, approve_fully, make_contract
 
 FAKE_KEY = "fake-" + "credential-" + "value-98765"
 ROLES = [r.value for r in Role]
@@ -21,7 +21,7 @@ ROLES = [r.value for r in Role]
 
 def _registry(specs=None, environ=None):
     specs = specs if specs is not None else [AgentSpec(role=r) for r in ROLES]
-    return AgentRegistry(specs, all_mock_adapters(), environ or {})
+    return AgentRegistry(specs, all_mock_adapters(), environ or {}, TEST_PRICES)
 
 
 def test_all_five_roles_resolve_to_mock_adapters():
@@ -58,7 +58,7 @@ def test_real_adapter_without_credentials_fails_closed(environ):
 
 
 def test_real_adapter_with_credentials_still_fails_closed_because_none_is_implemented_in_m2():
-    reg = _registry([AgentSpec(role="executor", kind="real", credential_env="EXEC_KEY")], {"EXEC_KEY": FAKE_KEY})
+    reg = _registry([AgentSpec(role="executor", kind="real", credential_env="EXEC_KEY", model="unit-model")], {"EXEC_KEY": FAKE_KEY})
     with pytest.raises(AdapterUnavailable, match="no real adapter implementation"):
         reg.resolve("executor")
     assert reg.real_roles() == {"executor"}
@@ -66,7 +66,7 @@ def test_real_adapter_with_credentials_still_fails_closed_because_none_is_implem
 
 def test_routing_failure_is_audited_and_never_leaks_the_credential(repo):
     t = approve_fully(repo, repo.create_task(make_contract(), HUMAN).task)
-    reg = _registry([AgentSpec(role="executor", kind="real", credential_env="EXEC_KEY")], {"EXEC_KEY": FAKE_KEY})
+    reg = _registry([AgentSpec(role="executor", kind="real", credential_env="EXEC_KEY", model="unit-model")], {"EXEC_KEY": FAKE_KEY})
     with pytest.raises(AdapterUnavailable):
         reg.route(repo, t)
     ev = [e for e in repo.iter_events() if e.event_type == "agent.route_failed"]

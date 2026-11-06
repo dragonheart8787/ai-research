@@ -19,6 +19,7 @@ from airos.domain.schemas import (
 )
 from airos.domain.states import Actor, ActorKind, Event
 from airos.persistence.sqlite_repo import SYSTEM, SqliteRepository
+from airos.pricing import PriceTable
 
 HUMAN = Actor(ActorKind.HUMAN, "human-1")
 HUMAN2 = Actor(ActorKind.HUMAN, "human-2")
@@ -28,6 +29,11 @@ EXECUTOR = Actor(ActorKind.EXECUTOR, "executor-1")
 CGW = Actor(ActorKind.CHATGPT_WORK, "chatgpt_work-1")
 SCI = Actor(ActorKind.AI_SCIENTIST, "ai_scientist-1")
 AGENT_ACTORS = (PLANNER, DIRECTOR, EXECUTOR, CGW, SCI)
+
+# Test price table: "unit-model" costs exactly 1 micro-USD per token (in and out), so tests can pick USD by picking tokens.
+TEST_PRICES = PriceTable.from_dict({
+    "schema": "airos-prices/1", "version": "test-v1", "currency": "USD", "unit": "usd_micro_per_million_tokens",
+    "models": {"mock": {"input": 0, "output": 0}, "unit-model": {"input": 1_000_000, "output": 1_000_000}}})
 
 _counter = itertools.count(1)
 
@@ -79,6 +85,7 @@ def open_repo(db_path: Path, clock: FakeClock, tmp_path: Path) -> Iterator[Calla
 
     def _open(**kw: object) -> SqliteRepository:
         kw.setdefault("clock", clock)
+        kw.setdefault("price_table", TEST_PRICES)
         kw.setdefault("anchor_path", tmp_path / "anchors" / "audit-anchors.log")
         r = SqliteRepository(db_path, **kw)  # type: ignore[arg-type]
         made.append(r)

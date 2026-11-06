@@ -41,7 +41,8 @@ def _approved(repo, **over):
 
 
 def _usage(usd=0, tin=0, tout=0):
-    return ResourceUsage(tokens_in=tin, tokens_out=tout, usd_micro=usd, wall_ms=1, measured_by="adapter")
+    """USD is derived from tokens by the control plane (unit-model = 1 micro-USD/token); the reported usd is irrelevant."""
+    return ResourceUsage(tokens_in=tin + usd, tokens_out=tout, usd_micro=usd, wall_ms=1, measured_by="adapter", model="unit-model")
 
 
 def _sums(repo, budget_id):
@@ -144,9 +145,9 @@ def test_settle_books_measured_usage_and_releases_the_rest(repo):
     repo.complete_run(run_id, "w1", RunState.SUCCEEDED, verifier_passed=True, usage=_usage(usd=250_000, tin=100, tout=50))
     for bid in (f"task:{t.task_id}", f"root:{t.root_task_id}"):
         s = _sums(repo, bid)
-        assert (s["reserve"], s["release"], s["settle"]) == (USD, -USD, 250_000)
-        assert repo.budget_status(bid).used_usd_micro == 250_000
-    assert repo.budget_status(f"task:{t.task_id}").used_tokens == 150
+        assert (s["reserve"], s["release"], s["settle"]) == (USD, -USD, 250_150)       # 250_100 in + 50 out tokens @ 1 micro/token
+        assert repo.budget_status(bid).used_usd_micro == 250_150
+    assert repo.budget_status(f"task:{t.task_id}").used_tokens == 250_150
 
 
 def test_cancel_while_queued_releases_without_charging(repo):

@@ -1,0 +1,10 @@
+{
+  "schema": "airos-prices/1",
+  "version": "REPLACE-WITH-A-VERSION-YOU-CONTROL",
+  "currency": "USD",
+  "unit": "usd_micro_per_million_tokens",
+  "models": {
+    "mock": {"input": 0, "output": 0},
+    "your-model-id": {"input": 0, "output": 0}
+  }
+}

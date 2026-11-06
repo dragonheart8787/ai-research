@@ -17,7 +17,7 @@ api = ["fastapi", "uvicorn"]
 where = ["src"]
 
 [tool.setuptools.package-data]
-airos = ["persistence/migrations/*.sql", "security/permissions.json"]
+airos = ["persistence/migrations/*.sql", "security/permissions.json", "pricing_data/*.json"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

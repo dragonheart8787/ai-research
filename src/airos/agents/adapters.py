@@ -54,7 +54,7 @@ class MockAdapter:
         behavior = self.script(request)
         if behavior == "crash":
             raise RuntimeError("mock adapter crashed")
-        usage = ResourceUsage(tokens_in=0, tokens_out=0, usd_micro=0, wall_ms=1, measured_by="adapter")
+        usage = ResourceUsage(tokens_in=0, tokens_out=0, usd_micro=0, wall_ms=1, measured_by="adapter", model="mock")
         if behavior in ("transient_failure", "permanent_failure"):
             transient = behavior == "transient_failure"
             err = ErrorRecord(ts_ms=0, attempt=request.attempt, error_class="transient" if transient else "adapter_error",

@@ -297,6 +297,11 @@ class Run(StrictModel):
     ended_at_ms: int | None
     error_class: str | None
     error_detail: str | None
+    model: str | None = None
+    cost_usd_micro: int | None = None
+    cost_basis: Literal["priced", "worst_case"] | None = None
+    price_table_version: str | None = None
+    price_table_sha256: str | None = None
 
 
 # ---------------------------------------------------------------- agent I/O
@@ -365,6 +370,7 @@ class ResourceUsage(StrictModel):
     cpu_ms: int | None = Field(None, ge=0)
     peak_mem_bytes: int | None = Field(None, ge=0)
     measured_by: Literal["adapter", "container", "self_reported"]
+    model: str | None = None  # the control plane prices tokens by model; adapter-reported usd_micro is ignored
 
 
 class AcceptanceResult(StrictModel):

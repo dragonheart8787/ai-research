@@ -81,6 +81,7 @@ from airos.persistence import budget_sql
 from airos.persistence.denials import DenialAuditor
 from airos.persistence.interfaces import AuditHead, CreateResult, RecoveryAction, RecoveryReport, Repository
 from airos.persistence.migrate import migrate
+from airos.pricing import PriceTable
 from airos.redaction import Redactor
 from airos.security.permissions import authorize, may_read_artifact
 
@@ -122,6 +123,7 @@ class SqliteRepository:
         anchor_path: str | os.PathLike[str] | None = None,
         real_roles: Iterable[str] = (),
         workspace_fresh_guaranteed: bool = False,
+        price_table: PriceTable | None = None,
     ) -> None:
         self.path = str(path)
         self.clock: Clock = clock or SystemClock()
@@ -129,6 +131,7 @@ class SqliteRepository:
         self._new_id = id_factory or (lambda: uuid.uuid4().hex)
         self.limits = limits or Limits()
         self.anchor_path = Path(anchor_path) if anchor_path else None
+        self.price_table = price_table or PriceTable.default()
         self._real_roles = frozenset(real_roles)
         self._workspace_fresh_guaranteed = workspace_fresh_guaranteed
         self._denials = DenialAuditor(self)
@@ -639,15 +642,38 @@ class SqliteRepository:
 
     def _close_reservation(self, conn: sqlite3.Connection, task: TaskRecord, attempt: int, *, run_id: str | None,
                            settle: bool, usage: ResourceUsage | None) -> None:
-        actual_u = usage.usd_micro if usage is not None else None
-        actual_t = (usage.tokens_in + usage.tokens_out) if usage is not None else None
+        """Release the reservation; if `settle`, book the spend.
+
+        USD is COMPUTED here as tokens x the pinned price table. Adapter-reported USD is only cross-checked (audit flag on
+        >5% divergence). Unmeasured usage, a missing model, or a model without a price all settle at WORST CASE + audit flag.
+        """
+        actual_u: int | None = None
+        actual_t: int | None = None
+        if settle and usage is not None:
+            cost = self.price_table.cost_usd_micro(usage.model, usage.tokens_in, usage.tokens_out)
+            if cost is None:
+                self._append_event(conn, "pricing.flag", SYSTEM, task_id=task.task_id, run_id=run_id, payload={
+                    "reason": "missing_model" if usage.model is None else "unknown_model_no_price", "model": usage.model,
+                    "price_table_version": self.price_table.version, "settled": "worst_case"})
+            else:
+                actual_u, actual_t = cost, usage.tokens_in + usage.tokens_out
+                if abs(usage.usd_micro - cost) * 100 > 5 * max(cost, 1):
+                    self._append_event(conn, "usage.divergence", SYSTEM, task_id=task.task_id, run_id=run_id, payload={
+                        "adapter_reported_usd_micro": usage.usd_micro, "computed_usd_micro": cost, "model": usage.model,
+                        "used": "computed"})
         n = budget_sql.close(conn, task, attempt, self.clock.now_ms(), self._new_id, run_id=run_id, settle=settle,
                              actual_usd=actual_u, actual_tokens=actual_t)
+        if settle and run_id is not None and n:
+            conn.execute(
+                "UPDATE runs SET model=?, cost_usd_micro=?, cost_basis=?, price_table_version=?, price_table_sha256=? WHERE run_id=?",
+                (usage.model if usage is not None else None, actual_u, "priced" if actual_u is not None else "worst_case",
+                 self.price_table.version, self.price_table.sha256, run_id))
         if n:
             self._append_event(conn, "budget.settled" if settle else "budget.released", SYSTEM, task_id=task.task_id,
-                               run_id=run_id, payload={"attempt": attempt, "levels": n,
-                                                       "worst_case": settle and usage is None,
-                                                       "usd_micro": actual_u, "tokens": actual_t})
+                               run_id=run_id, payload={"attempt": attempt, "levels": n, "worst_case": settle and actual_u is None,
+                                                       "usd_micro": actual_u, "tokens": actual_t,
+                                                       "price_table_sha256": self.price_table.sha256 if settle else None})
+
     def amend_task(self, task_id: str, new_contract: TaskContract, expected_version: int, actor: Actor) -> TaskRecord:
         with self._denial_scope(actor, "task.amend", task_id):
             return self._amend_task(task_id, new_contract, expected_version, actor)
@@ -795,7 +821,9 @@ class SqliteRepository:
             run_id=r["run_id"], task_id=r["task_id"], attempt=r["attempt"], agent_id=r["agent_id"],
             state=RunState(r["state"]), lease_owner=r["lease_owner"], lease_expires_at_ms=r["lease_expires_at_ms"],
             heartbeat_at_ms=r["heartbeat_at_ms"], started_at_ms=r["started_at_ms"], ended_at_ms=r["ended_at_ms"],
-            error_class=r["error_class"], error_detail=r["error_detail"],
+            error_class=r["error_class"], error_detail=r["error_detail"], model=r["model"],
+            cost_usd_micro=r["cost_usd_micro"], cost_basis=r["cost_basis"], price_table_version=r["price_table_version"],
+            price_table_sha256=r["price_table_sha256"],
         )
 
     def list_runs(self, task_id: str) -> list[Run]:

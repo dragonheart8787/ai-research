@@ -10,6 +10,7 @@ from airos.agents.adapters import AgentAdapter
 from airos.domain.schemas import Role, TaskRecord
 from airos.errors import AdapterUnavailable
 from airos.persistence.sqlite_repo import SqliteRepository
+from airos.pricing import PriceTable
 
 
 @dataclass(frozen=True)
@@ -18,10 +19,13 @@ class AgentSpec:
     kind: Literal["mock", "real"] = "mock"
     enabled: bool = True
     credential_env: str | None = None  # name of the env var holding the credential (never the value)
+    model: str | None = None  # real adapters: must have an entry in the pinned price table
 
 
 class AgentRegistry:
-    def __init__(self, specs: list[AgentSpec], adapters: Mapping[Role, AgentAdapter], environ: Mapping[str, str]) -> None:
+    def __init__(self, specs: list[AgentSpec], adapters: Mapping[Role, AgentAdapter], environ: Mapping[str, str],
+                 price_table: PriceTable | None = None) -> None:
+        self._prices = price_table or PriceTable.default()
         self._specs = {s.role: s for s in specs}
         self._adapters = dict(adapters)
         self._environ = environ
@@ -42,6 +46,9 @@ class AgentRegistry:
         if spec.kind == "real":
             if not spec.credential_env or not self._environ.get(spec.credential_env):
                 raise AdapterUnavailable(f"real adapter for {role!r} has no configured credentials")
+            if not self._prices.has(spec.model):
+                raise AdapterUnavailable(
+                    f"real adapter for {role!r}: model {spec.model!r} has no entry in price table {self._prices.version}")
             raise AdapterUnavailable(f"no real adapter implementation exists for {role!r} in this build (mock-only)")
         adapter = self._adapters.get(r)
         if adapter is None or not adapter.is_mock:
