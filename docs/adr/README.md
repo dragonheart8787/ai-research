@@ -12,3 +12,4 @@ Format: Status / Context / Decision / Consequences / Alternatives. Date of all i
 | [0006](0006-docker-as-isolation-layer.md) | Docker as the isolation layer |
 | [0007](0007-rust-vs-python-components.md) | Rust vs Python for sandbox runner and audit verifier |
 | [0008](0008-humans-only-approvals-and-no-agent-api-access.md) | Humans are the only approvers; agents have no API access |
+| [0009](0009-approval-binding-to-task-version-and-contract-hash.md) | Approvals bind to task version and contract hash |

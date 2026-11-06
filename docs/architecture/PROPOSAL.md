@@ -5,6 +5,8 @@
 - Scope of this document: environment inspection and design only. No implementation code, no installs, no external API calls, no containers, no GPU/training work were performed or are authorised by this document.
 - Codename used below: `airos` (Python package), "control plane" = the single FastAPI process that owns state.
 
+**Amendments (2026-11-06, human review "approved with changes"):** see ADR-0009 (approval binding to task version + contract hash), the revised §5.3 anchoring, §7 operator-token authentication, §11.2 Q6 decision, §4.3 concurrency/Clock notes and §11.4 untrusted-input rule. Where this text and an ADR disagree, the newer ADR wins.
+
 Conventions: **MUST / MUST NOT** are normative and each is meant to be testable. Every numeric default is a *proposed default*, configurable in `config/limits.toml` unless marked **HARD** (not configurable without a code change and a new ADR). Open questions are collected in §15.2; nothing ambiguous is silently decided.
 
 ---
@@ -76,11 +78,11 @@ Conventions: **MUST / MUST NOT** are normative and each is meant to be testable.
 
 | # | Component | Responsibility | Key constraints |
 |---|---|---|---|
-| C1 | **FastAPI control plane** | Only writer of state. Exposes `/v1/*`. Binds `127.0.0.1`. Bearer-token authn mapped to a `principals` row. | Agents never call it (see ADR-0008). Mutating endpoints require `principal.type=human` unless listed otherwise in §8. |
+| C1 | **FastAPI control plane** | Only writer of state. Exposes `/v1/*`. Binds `127.0.0.1`. Mutating human endpoints (approve, deny, cancel, budget grant, release) require the **operator token**, read from env var `AIROS_OPERATOR_TOKEN` at startup (compared in constant time; only its sha256 is ever kept in memory/logs; never stored in the DB or repo). Status/dashboard endpoints are **read-only** (GET only). Agents never receive this token (it is not passed to adapters or containers). | Agents never call it (see ADR-0008). Mutating endpoints require `principal.type=human` unless listed otherwise in §8. |
 | C2 | **SQLite persistence** | WAL, `synchronous=FULL`, `foreign_keys=ON`, `busy_timeout=5000`, single writer (control plane). | Plain SQL through a **repository layer**; one `Repository` Protocol per aggregate; no ORM. Portable subset only (§5.0). See ADR-0001. |
 | C3 | **Agent adapters** | Uniform interface (§4.1). Mock and real implementations. | Real adapter activates only if explicitly enabled **and** credentials present; otherwise mock. |
 | C4 | **Scheduler / worker loop** | Moves `approved→queued→running`, leases, heartbeats, retries, timeouts, recovery. | In-process now (asyncio task + a bounded thread pool for blocking adapters). Talks to a `WorkQueue` Protocol so a dedicated queue can replace it. See ADR-0002. |
-| C5 | **Approval service** | Creates approval requests, records human decisions, binds each to `spec_hash`, expires them. | Decider must be `human`; enforced by service **and** DB trigger. |
+| C5 | **Approval service** | Creates approval requests, records human decisions, binds each to `(task_id, task_version, contract_sha256)` (ADR-0009), expires them. | Decider must be `human`; enforced by service **and** DB trigger. |
 | C6 | **Budget ledger** | Append-only ledger; reserve → settle; hard stop; human-only grants. | Integer micro-USD; invariant checked in-transaction. |
 | C7 | **Artifact registry** | Content-addressed store + provenance + lineage; trust level per artifact. | Files immutable; DB rows immutable (no UPDATE except `trust_level` via release action, which is itself audited). |
 | C8 | **Audit log** | `task_events`, append-only, hash-chained. | Triggers deny UPDATE/DELETE. See ADR-0003. |
@@ -134,9 +136,9 @@ All five implement `AgentAdapter` (§4.1). Each role has exactly one `agents` ro
 | State | Terminal? | Meaning |
 |---|---|---|
 | `draft` | no | Contract being formed; mutable. |
-| `planned` | no | Contract complete and **frozen** (`spec_hash` computed; any change = new task with `supersedes_task_id`). |
+| `planned` | no | Contract complete; `contract_sha256` computed. Changes are allowed in `draft`/`planned`/`awaiting_approval`/`approved` but every change bumps `version` and invalidates all existing approvals (ADR-0009). |
 | `awaiting_approval` | no | Pending ≥1 human approval. |
-| `approved` | no | All required approvals granted for the current `spec_hash`. |
+| `approved` | no | All required approvals granted for the current `(version, contract_sha256)`. |
 | `queued` | no | Eligible for scheduler; may carry `not_before`. |
 | `running` | no | Leased by a worker (work) or children in flight (objective). |
 | `review` | no | Output exists and passed machine verification; awaiting verdict. |
@@ -156,20 +158,20 @@ Triggers: **H** human, **S** system (control-plane code, deterministic; never an
 
 | ID | From → To | Trigger | Guard conditions | Effects |
 |---|---|---|---|---|
-| T01 | draft → planned | P, H | Plan/contract validates against schema v1; `depth ≤ 3`; `children ≤ 8`; `root_total ≤ 25`; Σ child `max_usd` ≤ parent `max_usd`; `spec_hash` computed; `side_effect_class` set | freeze spec; create child tasks in `draft`→(they receive plans by P in turn); event `task.planned` |
+| T01 | draft → planned | P, H | Plan/contract validates against schema v1; `depth ≤ 3`; `children ≤ 8`; `root_total ≤ 25`; Σ child `max_usd` ≤ parent `max_usd`; `contract_sha256` computed; `side_effect_class` set | freeze spec; create child tasks in `draft`→(they receive plans by P in turn); event `task.planned` |
 | T02 | draft → cancelled | H, D | Task non-terminal | cascade to descendants |
 | T03 | planned → awaiting_approval | S | Policy yields ≥1 required approval (§9 rule R-APPROVE) | create approvals `pending`, `expires_at = now+72h` |
 | T04 | planned → approved | S | Policy yields **zero** required approvals **and** `side_effect_class=none` **and** `max_usd ≤ auto_approve_usd` (default `0`) | event records `approved_by=policy:auto`; no approval row |
 | T05 | planned → cancelled | H, D | — | cascade |
-| T06 | awaiting_approval → approved | H | Every required approval for the current `spec_hash` is `granted` by a `human` principal; none `denied`/`expired`/`revoked` | event `task.approved` |
-| T07 | awaiting_approval → draft | H | reason ≥ 1 char (request changes) | approvals `revoked`; spec unfrozen (new `spec_hash` on re-plan) |
+| T06 | awaiting_approval → approved | H | Every required approval bound to the current `version` **and** `contract_sha256` is `granted` by a `human` principal; none `denied`/`expired`/`revoked` | event `task.approved` |
+| T07 | awaiting_approval → draft | H | reason ≥ 1 char (request changes) | approvals `revoked`; any re-plan amendment bumps `version` |
 | T08 | awaiting_approval → cancelled | H | any approval `denied` or explicit cancel | cascade |
 | T09 | awaiting_approval → timed_out | S | `now ≥ expires_at` and approvals still `pending` | approvals `expired` |
-| T10 | approved → queued | S | all `depends_on` tasks `completed`; `spec_hash == approved spec_hash`; grant age ≤ 7 d; adapter for role enabled | event `task.queued` |
+| T10 | approved → queued | S | all `depends_on` tasks `completed`; `approval (version, contract_sha256) == task (version, contract_sha256)`; grant age ≤ 7 d; adapter for role enabled | event `task.queued` |
 | T11 | approved → awaiting_approval | S | grant age > 7 d before queued | new pending approvals |
 | T12 | approved → cancelled | H, D | — | cascade |
 | T13 | approved → blocked | S | any dependency `failed`/`timed_out`/`cancelled` | `blocked_reason=dependency_failed` |
-| T14 | queued → running | S (worker) | CAS on `state_version`; `not_before ≤ now`; global running < `max_concurrent_runs` (2) and per-role < 1; **budget reservation succeeds at task, root and global levels** (§10); for `work`: new `runs` row (`attempt = attempt_count+1`, lease set) and `attempt_count` incremented; for `objective`: no run row | reserve ledger entry |
+| T14 | queued → running | S (worker) | CAS on `version`; `not_before ≤ now`; global running < `max_concurrent_runs` (2) and per-role < 1; **budget reservation succeeds at task, root and global levels** (§10); for `work`: new `runs` row (`attempt = attempt_count+1`, lease set) and `attempt_count` incremented; for `objective`: no run row | reserve ledger entry |
 | T15 | queued → blocked | S | reservation fails (`budget_insufficient`) or dependency failed or adapter disabled/missing credential (`adapter_unavailable`) | no reservation held |
 | T16 | queued → cancelled | H, D | — | cascade |
 | T17 | running → review | S | `work`: valid `AgentResponse` with `status=succeeded`; Verifier passed (all hashes recomputed, schema ok, all `machine` acceptance criteria re-run and passed, usage re-measured); settlement ledger entry written. `objective`: all children `completed` | ingest artifacts + lineage; settle |
@@ -189,7 +191,7 @@ Triggers: **H** human, **S** system (control-plane code, deterministic; never an
 
 Cancellation of a parent cancels all non-terminal descendants in one transaction. `running→cancelled` for `work` first sets `cancel_requested=1`; transition commits only after container stop is confirmed (or, for `awaiting_external`, abandonment is recorded).
 
-**Enforcement (defence in depth):** (1) pure-function `TaskStateMachine.transition(task, event, principal)` in the domain layer; (2) service layer authz check; (3) DB table `allowed_transitions(from_state,to_state)` seeded by migration + `BEFORE UPDATE OF state` trigger rejecting unlisted pairs and any change from a terminal state; (4) optimistic concurrency via `state_version`.
+**Enforcement (defence in depth):** (1) pure-function `TaskStateMachine.transition(task, event, principal)` in the domain layer; (2) service layer authz check; (3) DB table `allowed_transitions(from_state,to_state)` seeded by migration + `BEFORE UPDATE OF state` trigger rejecting unlisted pairs and any change from a terminal state; (4) every transition runs inside `BEGIN IMMEDIATE` with compare-and-swap on `tasks.version` (`UPDATE … WHERE task_id=? AND version=?`; 0 rows ⇒ `VersionConflict`). All timestamps are UTC epoch milliseconds obtained from an **injectable `Clock`** (`now_ms()`); no code path reads the wall clock directly, so tests use a fake clock and never sleep.
 
 ### 4.4 Limits (retry and recursion)
 
@@ -220,7 +222,7 @@ Plain SQL only; IDs are UUIDv7 as `TEXT` (→ `UUID`); timestamps are `INTEGER` 
 
 **agents** — `agent_id*` PK, `role*` UQ, `principal_id*` FK, `adapter_kind*` (`mock|real`), `adapter_version*`, `config_hash*`, `image_digest` (executor/scientist), `enabled*`, `enabled_by` FK principals, `enabled_at`.
 
-**tasks** — `task_id*` PK; `idempotency_key*` **UQ**; `kind*` (`work|objective`); `root_task_id*`; `parent_task_id`; `depth*` CHECK 0..5; `supersedes_task_id`; `retry_of_task_id`; `assigned_role*`; `state*`; `state_version*` (CAS counter); `blocked_reason`; `blocked_from`; `spec_json*`; `spec_hash*` (sha256 of canonical contract minus mutable fields); `side_effect_class*` (`none|workspace_write|external_write|destructive`); `attempt_count*`; `max_retries*`; `review_cycles*`; `timeout_retries*`; `not_before`; `cancel_requested*`; `is_mock*`; `created_by*` FK principals; `created_at*`; `updated_at*`. Indexes: `(state, not_before)`, `(root_task_id)`, `(parent_task_id)`.
+**tasks** — `task_id*` PK; `idempotency_key*` **UQ**; `kind*` (`work|objective`); `root_task_id*`; `parent_task_id`; `depth*` CHECK 0..5; `supersedes_task_id`; `retry_of_task_id`; `assigned_role*`; `state*`; `version*` (CAS counter, starts at 1; bumped on every state change and every amendment); `contract_version*` (starts at 1; bumped only by contract/budget amendments; this is the `task_version` approvals bind to, see ADR-0009); `blocked_reason`; `blocked_from`; `contract_json*`; `contract_sha256*` (sha256 of the canonical contract, which excludes `task_id` and all mutable state); `side_effect_class*` (`none|workspace_write|external_write|destructive`); `attempt_count*`; `max_retries*`; `review_cycles*`; `timeout_retries*`; `not_before`; `cancel_requested*`; `is_mock*`; `created_by*` FK principals; `created_at*`; `updated_at*`. Indexes: `(state, not_before)`, `(root_task_id)`, `(parent_task_id)`.
 
 **task_dependencies** — `task_id*`, `depends_on_task_id*`; PK both; CHECK not equal.
 
@@ -232,7 +234,7 @@ Plain SQL only; IDs are UUIDv7 as `TEXT` (→ `UUID`); timestamps are `INTEGER` 
 
 **task_events** (audit, append-only) — `seq*` INTEGER PK (monotonic, gapless, assigned inside the writer transaction); `event_id*` UQ; `ts*`; `task_id`; `run_id`; `event_type*`; `actor_principal_id*`; `actor_type*`; `from_state`; `to_state`; `payload_json*` (redacted, canonical JSON); `prev_hash*`; `entry_hash*` UQ. Triggers: `BEFORE UPDATE` and `BEFORE DELETE` → `RAISE(ABORT)`.
 
-**approvals** — `approval_id*` PK; `task_id*`; `approval_type*` (`execute|cost|destructive|external_handoff|budget_increase|limit_increase|artifact_release`); `spec_hash*`; `requested_by*`; `requested_at*`; `expires_at*`; `status*` (`pending|granted|denied|expired|revoked`); `decided_by` FK principals; `decided_at`; `reason`; `amount_json` (for budget/limit). Trigger: on `status IN ('granted','denied')` require `decided_by` principal `type='human'` (**no exceptions**). **Partial UQ(task_id, approval_type, spec_hash) WHERE status IN ('pending','granted')**.
+**approvals** — `approval_id*` PK; `task_id*`; `approval_type*` (`execute|cost|destructive|external_handoff|budget_increase|limit_increase|artifact_release`); `task_version*`; `contract_sha256*` (both immutable, trigger-enforced; an approval is valid only while both equal the task's current values); `requested_by*`; `requested_at*`; `expires_at*`; `status*` (`pending|granted|denied|expired|revoked|invalidated`); `decided_by` FK principals; `decided_at`; `reason`; `amount_json` (for budget/limit). Trigger: on `status IN ('granted','denied')` require `decided_by` principal `type='human'` (**no exceptions**). **Partial UQ(task_id, approval_type, task_version) WHERE status IN ('pending','granted')**.
 
 **budgets** — `budget_id*` PK; `scope*` (`global_daily|root|task|ai_scientist|role`); `scope_ref*`; `limit_usd_micro*`; `limit_tokens*`; `limit_wall_s*`; `state*` (`active|exhausted|frozen`); `created_at*`. UQ(scope, scope_ref).
 
@@ -253,7 +255,7 @@ For every artifact: `provenance = {sha256, producer_run_id | producer_principal_
 - **Single chain per database**; `seq` gapless. Writes serialised by `BEGIN IMMEDIATE`; the event row is written in the **same transaction** as the state change it records (no state change without an event, no event without its state change).
 - **Redaction before hashing:** payloads are redacted first; the hash covers the redacted bytes.
 - **Verification:** `airos audit verify [--from seq]` recomputes the chain and checks gapless `seq`; exposed at `GET /v1/audit/verify`. Startup verifies the last 1 000 entries (full verify if total ≤ 100 000).
-- **Anchoring (limits of tamper evidence):** a chain inside the same DB detects partial edits but not a full rewrite by someone who can rewrite the whole DB. Every 1 000 events or 24 h the head `(seq, entry_hash)` is appended to `anchors/audit-anchors.log` on a separate volume, and printed by `airos status`. Optional (off by default, human decision, Q4) publication of anchors to GitHub.
+- **Anchoring (limits of tamper evidence):** a chain inside the same DB detects partial edits but not a full rewrite by someone who can rewrite the whole DB. The head `(ts, seq, entry_hash, event_type)` is appended (one line, fsync'd) to `anchors/audit-anchors.log` on a separate volume **on every human approval decision and on every root-objective completion**; a human commits that file to git weekly. There is no automatic push and no time-based anchoring.
 - Test vectors for the chain (input events → expected hashes) are stored in `tests/vectors/audit_chain.json` so an independent verifier (see ADR-0007) can be built in any language.
 
 ---
@@ -319,12 +321,12 @@ class TaskContract(BaseModel):
     human_review_required: bool = False
     depends_on: list[str] = []
     parent_task_id: str | None
-    # mutable, excluded from spec_hash:
+    # mutable; held on the task record, not in the hashed contract:
     status: TaskState
     error_history: list[ErrorRecord]
     execution_history: list[ExecutionRecord]
 ```
-`spec_hash = sha256(canonical_json(contract minus {status, error_history, execution_history}))`. Validators: `dependencies acyclic`; `machine criteria have check`; `command_exit_zero` only if `assigned_role=executor`; `side_effect_class ∈ {external_write,destructive}` ⇒ `approval_requirements` contains `destructive` or `external_handoff`; `max_usd_micro > 0` ⇒ contains `cost`.
+`contract_sha256 = sha256(canonical_json(contract))`; the contract excludes `task_id` and the mutable `status`, `error_history`, `execution_history` (those live on the task record/runs), so an idempotent re-create with a fresh `task_id` hashes identically. Validators: `dependencies acyclic`; `machine criteria have check`; `command_exit_zero` only if `assigned_role=executor`; `side_effect_class ∈ {external_write,destructive}` ⇒ `approval_requirements` contains `destructive` or `external_handoff`; `max_usd_micro > 0` ⇒ contains `cost`.
 
 ### 6.2 Agent response schema (`schema_version = "agent-response/1"`)
 
@@ -417,11 +419,12 @@ Notes: 1 only if `director_may_create_root=true` (default **false**). 2 only for
 ## 8. Duplicate prevention and recovery
 
 ### 8.1 Duplicate prevention
-- `tasks.idempotency_key` UNIQUE. `POST /v1/tasks` with an existing key and **identical** `spec_hash` returns the existing task (HTTP 200); same key with a **different** `spec_hash` returns 409 and records an audit event.
+- `tasks.idempotency_key` UNIQUE. `POST /v1/tasks` with an existing key and **identical** `contract_sha256` returns the existing task (HTTP 200); same key with a **different** `contract_sha256` returns 409 and records an audit event.
 - `runs`: UNIQUE(task_id, attempt) and partial UNIQUE(task_id) for active states ⇒ at most one active run per task, enforced by the DB.
-- Claim is a CAS on `state_version`; two workers (or a restarted process racing a zombie) cannot both win.
+- Claim is a CAS on `version`; two workers (or a restarted process racing a zombie) cannot both win.
 - `budget_ledger.idempotency_key` UNIQUE ⇒ a reservation/settlement cannot be applied twice.
-- `approvals` partial UNIQUE ⇒ no duplicate pending/granted approvals per (task, type, spec).
+- `approvals` partial UNIQUE ⇒ no duplicate pending/granted approvals per (task, type, version).
+- **Approval invalidation (ADR-0009):** `amend_task` (any contract or resource-limit/budget change) bumps `tasks.version`, recomputes `contract_sha256`, and in the same transaction marks every `pending`/`granted` approval `invalidated`; if the task was `approved` it returns to `awaiting_approval`. `decide_approval` and transition T06/T10 re-check `(task_version, contract_sha256)` and refuse stale approvals.
 - `artifacts` UNIQUE(producer_run_id, logical_name); CAS store keyed by sha256 (re-ingest is a no-op).
 - Handoff dispatch deterministic path + content ⇒ re-dispatch is a no-op.
 
@@ -448,7 +451,7 @@ Tasks with `side_effect_class ∈ {external_write, destructive}` after an unknow
 ---
 
 ## 9. Approval requirements (rule R-APPROVE)
-Required approvals for a task, computed deterministically at T03/T04 from its contract: `execute` if `assigned_role ∈ {executor, ai_scientist}` or `side_effect_class ≠ none`; `cost` if `max_usd_micro > auto_approve_usd_micro` (default 0 ⇒ any metered work); `destructive` if `side_effect_class = destructive`; `external_handoff` if any input artifact leaves the host (ChatGPT Work dispatch, any GitHub push). The contract's declared `approval_requirements` must be a superset of the computed set (else T01 rejects, preventing an agent from under-declaring). Approvals are bound to `spec_hash`: any spec change invalidates them. An approval cannot be granted by the principal that created the task if that principal is an agent (agents cannot approve at all).
+Required approvals for a task, computed deterministically at T03/T04 from its contract: `execute` if `assigned_role ∈ {executor, ai_scientist}` or `side_effect_class ≠ none`; `cost` if `max_usd_micro > auto_approve_usd_micro` (default 0 ⇒ any metered work); `destructive` if `side_effect_class = destructive`; `external_handoff` if any input artifact leaves the host (ChatGPT Work dispatch, any GitHub push). The contract's declared `approval_requirements` must be a superset of the computed set (else T01 rejects, preventing an agent from under-declaring). Approvals are bound to `(task_id, task_version, contract_sha256)`: any contract or budget change invalidates them (ADR-0009). An approval cannot be granted by the principal that created the task if that principal is an agent (agents cannot approve at all).
 
 ---
 
@@ -481,7 +484,7 @@ Required approvals for a task, computed deterministically at T03/T04 from its co
 | Cleanup | `--rm` plus label `airos.run_id`; workspace deleted or archived 7 d after terminal. |
 
 ### 11.2 Secrets
-Secrets come only from environment variables or a secret store (e.g. Docker secrets/`/run/secrets`, sops-encrypted file outside the repo); never from the repo; `.gitignore` covers `.env*`, `data/`, `secrets/`. Preferred: the egress proxy **injects** the Executor's API credential on the wire so the key never enters the agent container (Q6); fallback: a dedicated, provider-spend-capped key passed as a single env var to that container only. All loaded secret values are registered with the `Redactor`, which (a) masks exact values (min length 8), (b) masks patterns (`sk-…`, `sk-ant-…`, `ghp_…`, `github_pat_…`, `AKIA…`, JWTs, PEM blocks), and (c) is applied to log records, event payloads, error details, captured stdout/stderr, and text artifacts at ingest — an artifact in which a secret is detected is rejected (`policy`, non-retryable) and not stored. CI runs secret scanning on every change.
+Secrets come only from environment variables or a secret store (e.g. Docker secrets/`/run/secrets`, sops-encrypted file outside the repo); never from the repo; `.gitignore` covers `.env*`, `data/`, `secrets/`. M4 decision (Q6): the Executor uses a **dedicated API key with a provider-side spend cap**, passed as a single env var to that container only. Egress-proxy key injection is deferred hardening and **not in scope** for M1–M5. All loaded secret values are registered with the `Redactor`, which (a) masks exact values (min length 8), (b) masks patterns (`sk-…`, `sk-ant-…`, `ghp_…`, `github_pat_…`, `AKIA…`, JWTs, PEM blocks), and (c) is applied to log records, event payloads, error details, captured stdout/stderr, and text artifacts at ingest — an artifact in which a secret is detected is rejected (`policy`, non-retryable) and not stored. CI runs secret scanning on every change.
 
 ### 11.3 Final-evaluation data
 Stored at `/var/lib/airos-eval/holdout/` (configurable), owned by a dedicated OS user `airos-eval` mode `0700`, **outside** the repo, `data/`, and every workspace root. It is not representable in any container spec: the sandbox runner's mount validator rejects any source under that prefix, and the path is on the denylist and excluded from artifact-class resolution. Only the host-side Evaluator (a deterministic process with no LLM and no network) reads it, and it returns scores (`eval_result`) only. Test: a contract/run-spec that attempts to mount it, or a symlink resolving into it, is rejected before `docker run`.
@@ -491,6 +494,7 @@ Stored at `/var/lib/airos-eval/holdout/` (configurable), owned by a dedicated OS
 - API binds `127.0.0.1`; behind a reverse proxy only if a human later adds TLS and authentication (out of scope for M1–M5).
 - **No self-hosted GPU runner is registered for this repository**, and none is exposed to PR code from forks. CI workflows (M2+) MUST use `pull_request` (never `pull_request_target` with checkout of the PR head), `permissions: contents: read`, GitHub-hosted runners only. A CI test greps `.github/workflows/*` and fails on `self-hosted`, `pull_request_target`, or `secrets.*` in PR-triggered jobs.
 - Untrusted text (handoff results, scientist output, web content) never gets tool-use authority; it is data in prompts and is labelled as such.
+- **Untrusted-input rule:** the set of actions an Executor run may take (`allowed_actions`, tools, commands, paths, network hosts) is derived **only** from the approved task contract (`allowed_actions` field, bound by `contract_sha256`) and static policy. Text found in artifacts, handoff results, web pages or model output can never add, widen or select an allowed action. The `AgentRequest` builder takes the contract as its only source of `allowed_actions` (test: artifact text containing instructions leaves the request unchanged).
 
 ---
 
@@ -602,12 +606,12 @@ Each milestone starts only after the human replies "approved" for that milestone
 | Q1 | Auto-approval threshold for zero-risk tasks? | `auto_approve_usd = 0` and only `side_effect_class=none`; everything metered needs a human |
 | Q2 | Budget numbers (global daily / root / task / Scientist)? | 25 / 10 / 2 / 10 USD; **real-adapter budgets start at 0** until set |
 | Q3 | Handoff repository for ChatGPT Work: separate repo or branch of this one? | Separate **private** repo `ai-research-handoff`; token scoped to it only |
-| Q4 | Where to anchor audit head hashes? | Local append-only file on a separate volume + human-committed weekly to git; no automatic push |
+| Q4 | Where to anchor audit head hashes? | **DECIDED:** append head hash to a file on a separate volume on every human approval and root-objective completion; human commits it weekly |
 | Q5 | Docker host for M4/M5 (this sandbox has no daemon)? | Human-supplied Linux VM with rootless Docker; develop M1–M3 here |
-| Q6 | Executor API credential handling: proxy-injected vs env var? | Proxy-injected; fallback to spend-capped dedicated key |
+| Q6 | Executor API credential handling | **DECIDED:** dedicated key with provider-side spend cap (M4); proxy injection deferred |
 | Q7 | AI Scientist v3 source, license, network/GPU needs? | Pin to a reviewed commit digest, CPU-only, no outbound network except its single LLM host, M5 only |
 | Q8 | Who reviews Director/Planner-produced outputs? | Human review mandatory (already in T23 guard) |
-| Q9 | Number of human operators / is SSO needed? | Single operator now; schema supports many; tokens via CLI |
+| Q9 | Number of human operators / is SSO needed? | Single operator now (operator token from `AIROS_OPERATOR_TOKEN`); schema supports many principals |
 | Q10 | Verify GitHub commit signatures on handoff results? | Require allowlisted author **and** verified signature if the ChatGPT Work workflow can sign; otherwise allowlisted author only + mandatory human review |
 | Q11 | Model IDs for each role? | Not hard-coded; set in `config/agents.toml` by the human at M4/M5 |
 | Q12 | Commit these docs to `main` or a branch/PR? | Branch + PR for review; nothing committed yet |
