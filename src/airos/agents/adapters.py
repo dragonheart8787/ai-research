@@ -18,7 +18,7 @@ from airos.domain.schemas import (
     Role,
 )
 
-Behavior = Literal["success", "transient_failure", "permanent_failure", "crash"]
+Behavior = Literal["success", "transient_failure", "permanent_failure", "crash", "invalid_output"]
 
 _CLASS_FOR_ROLE: dict[Role, ArtifactClass] = {
     Role.DIRECTOR: ArtifactClass.PLAN,
@@ -64,7 +64,7 @@ class MockAdapter:
         out = workdir / "out"
         out.mkdir(parents=True, exist_ok=True)
         produced: list[ProducedArtifact] = []
-        for eo in request.expected_output:
+        for eo in () if behavior == "invalid_output" else request.expected_output:   # claims success, delivers nothing
             data = f"[MOCK] {self.role.value} output for {eo.logical_name} (attempt {request.attempt})\n".encode()
             (out / eo.logical_name).write_bytes(data)
             produced.append(ProducedArtifact(

@@ -23,6 +23,12 @@ airos = ["persistence/migrations/*.sql", "security/permissions.json", "pricing_d
 testpaths = ["tests"]
 pythonpath = ["src"]
 addopts = "-ra -p no:cacheprovider"
+# Every warning is an error EXCEPT one exact, known message (Starlette 1.x deprecating httpx in TestClient; the
+# replacement package is not installed). Any other warning still fails the suite.
+filterwarnings = [
+    "error",
+    "ignore:Using .httpx. with .starlette.testclient. is deprecated:Warning",
+]
 markers = ["spec_only: checks a container run spec only; isolation NOT verified"]
 
 [tool.ruff]

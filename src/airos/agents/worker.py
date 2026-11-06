@@ -205,7 +205,12 @@ class Worker:
         forbidden = (self.artifacts.store.root, self.artifacts.store.eval_root)
         verdict = verify_response(request, response, workdir, forbidden)
         if not verdict.passed:
-            self._fail(run_id, retryable=False, error_class="schema_violation", detail="; ".join(verdict.problems), usage=usage)
+            if any("hash_mismatch" in p for p in verdict.problems):  # lying about content is a security signal: never retried
+                self._fail(run_id, retryable=False, error_class="hash_mismatch", detail="; ".join(verdict.problems), usage=usage)
+                return
+            # A verifier failure is retried ONCE per task (PROPOSAL): the first schema_violation is retryable, the second is not.
+            prior = sum(e.error_class == "schema_violation" for e in task.error_history)
+            self._fail(run_id, retryable=prior == 0, error_class="schema_violation", detail="; ".join(verdict.problems), usage=usage)
             return
         try:
             for p in response.produced_artifacts:
