@@ -14,6 +14,7 @@ class Limits:
     max_timeout_retries: int = 1
     lease_ttl_ms: int = 60_000
     approval_ttl_ms: int = 72 * 3600 * 1000
+    grant_ttl_ms: int = 7 * 24 * 3600 * 1000  # a granted approval is valid for 7 days (PROPOSAL T10/T11)
     review_ttl_ms: int = 72 * 3600 * 1000
     blocked_ttl_ms: int = 7 * 24 * 3600 * 1000
     backoff_base_ms: int = 30_000

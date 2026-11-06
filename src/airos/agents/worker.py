@@ -79,6 +79,11 @@ class Worker:
         """TTL watchdog (approval request, review, blocked). Each transition is guarded by the TTL itself, so calling
         this early is harmless. Returns ids moved to timed_out."""
         moved: list[str] = []
+        for t in self.repo.list_tasks(TaskState.APPROVED):  # human grants older than 7 days no longer authorise execution
+            try:
+                self.repo.transition(t.task_id, Event.REAPPROVE, SYSTEM, t.version, reason="approval grant expired")
+            except (GuardFailed, VersionConflict):
+                continue
         for state, event in ((TaskState.AWAITING_APPROVAL, Event.EXPIRE), (TaskState.REVIEW, Event.REVIEW_TIMEOUT),
                              (TaskState.BLOCKED, Event.BLOCK_TIMEOUT)):
             for t in self.repo.list_tasks(state):

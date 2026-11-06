@@ -496,8 +496,9 @@ class SqliteRepository:
         needed = {r.type.value for r in task.contract.approval_requirements}
         granted = {
             r[0] for r in conn.execute(
-                "SELECT approval_type FROM approvals WHERE task_id=? AND status='granted' AND task_version=? AND contract_sha256=?",
-                (task.task_id, task.contract_version, task.contract_sha256),
+                "SELECT approval_type FROM approvals WHERE task_id=? AND status='granted' AND task_version=? AND contract_sha256=? "
+                "AND decided_at_ms > ?",  # a grant is valid strictly less than grant_ttl_ms after the decision
+                (task.task_id, task.contract_version, task.contract_sha256, now - self.limits.grant_ttl_ms),
             )
         }
         expired = conn.execute(
@@ -521,6 +522,12 @@ class SqliteRepository:
             reservation_held=budget_sql.open_task_reserve(conn, task.task_id, task.attempt_count + 1) is not None,
             side_effectful=self._effective_side_effectful(task),
         )
+
+    def _expire_stale_grants(self, conn: sqlite3.Connection, task_id: str) -> int:
+        """Mark granted approvals older than grant_ttl_ms as expired (so a fresh approval can be requested)."""
+        cur = conn.execute("UPDATE approvals SET status='expired' WHERE task_id=? AND status='granted' AND decided_at_ms <= ?",
+                           (task_id, self.clock.now_ms() - self.limits.grant_ttl_ms))
+        return cur.rowcount
 
     def _guard_input(self, conn: sqlite3.Connection, task: TaskRecord, actor: Actor, ctx: GuardContext) -> GuardInput:
         return GuardInput(task=task, actor=actor, ctx=ctx, facts=self._facts(conn, task), limits=self.limits)
@@ -576,6 +583,8 @@ class SqliteRepository:
             conn.execute("UPDATE approvals SET status='revoked' WHERE task_id=? AND status IN ('pending','granted')", (task.task_id,))
         elif event is Event.EXPIRE:
             conn.execute("UPDATE approvals SET status='expired' WHERE task_id=? AND status='pending' AND expires_at_ms<=?", (task.task_id, now))
+        elif event is Event.REAPPROVE:
+            self._expire_stale_grants(conn, task.task_id)
         run_id: str | None = None
         if task.state is TaskState.RUNNING and task.kind is TaskKind.WORK:
             end = run_end or _DEFAULT_RUN_END.get(event, RunState.ABANDONED)
@@ -742,6 +751,7 @@ class SqliteRepository:
             self._check_actor(conn, requested_by)
             authorize(requested_by.kind, "approval.request")
             task = self._load_task(conn, task_id)
+            self._expire_stale_grants(conn, task_id)
             if task.state not in (TaskState.PLANNED, TaskState.AWAITING_APPROVAL):
                 raise GuardFailed("request_approval", f"cannot request approval in state {task.state.value}")
             if approval_type not in {r.type for r in task.contract.approval_requirements}:
@@ -1230,10 +1240,17 @@ class SqliteRepository:
                 return self._row_to_ledger(dup)  # single use: replay returns the same entry, never a second grant
             human = conn.execute("SELECT 1 FROM principals WHERE principal_id=? AND type='human' AND enabled=1",
                                  (row["decided_by"],)).fetchone()
-            if row["status"] != "granted" or human is None:
+            if row["status"] == "granted" and row["decided_at_ms"] <= self.clock.now_ms() - self.limits.grant_ttl_ms:
+                conn.execute("UPDATE approvals SET status='expired' WHERE approval_id=?", (approval_id,))
+                self._append_event(conn, "approval.expired", actor, task_id=row["task_id"],
+                                   payload={"approval_id": approval_id, "reason": "grant older than grant_ttl_ms at apply time"})
+                deferred = ApprovalExpired("the human grant is older than 7 days; request a new approval")
+            elif row["status"] != "granted" or human is None:
                 raise NotAuthorized("budget grant requires an approval granted by a human principal")
             task = self._load_task(conn, row["task_id"])
-            if row["task_version"] != task.contract_version or row["contract_sha256"] != task.contract_sha256:
+            if deferred is not None:
+                pass  # expired above: committed (status + audit event), then raised
+            elif row["task_version"] != task.contract_version or row["contract_sha256"] != task.contract_sha256:
                 conn.execute("UPDATE approvals SET status='invalidated' WHERE approval_id=?", (approval_id,))
                 self._append_event(conn, "approval.invalidated", actor, task_id=task.task_id,
                                    payload={"approval_id": approval_id, "reason": "stale binding at grant time"})
