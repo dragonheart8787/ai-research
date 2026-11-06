@@ -3,6 +3,8 @@
 * Mutations (create root task, decide approval, cancel) require the OPERATOR TOKEN, read once from the environment
   variable AIROS_OPERATOR_TOKEN. They act as the registered human principal `operator`. If the variable is unset or empty
   every mutation fails closed with 503. The token is compared in constant time and is never stored, logged or returned.
+* EVERY endpoint, GET included, requires the operator token, except /healthz, which returns no data (204). Routes are
+  registered on a router that carries the token dependency, so a newly added route is protected by default.
 * Status/dashboard endpoints are GET-only and read-only.
 * Agents never receive the token: build the AgentRegistry from `agent_environ(os.environ)`, which strips it.
 * serve() binds 127.0.0.1 by default and refuses any other host unless explicitly allowed.
@@ -14,7 +16,7 @@ import html
 from collections.abc import Mapping
 from typing import Annotated, Any
 
-from fastapi import Depends, FastAPI, Header, HTTPException
+from fastapi import APIRouter, Depends, FastAPI, Header, HTTPException, Response
 from pydantic import BaseModel, ConfigDict
 
 from airos.domain.schemas import TaskContract
@@ -69,6 +71,7 @@ def create_app(repo: SqliteRepository, environ: Mapping[str, str]) -> FastAPI:
     token_digest = hashlib.sha256(token.encode()).digest() if token else None
     repo.register_principal(OPERATOR.id, "human", None, "operator (API token holder)")
     app = FastAPI(title="airos control plane", docs_url=None, redoc_url=None, openapi_url=None)
+    public = APIRouter()
 
     def require_operator(authorization: str | None = Header(default=None)) -> Actor:
         if token_digest is None:
@@ -80,6 +83,12 @@ def create_app(repo: SqliteRepository, environ: Mapping[str, str]) -> FastAPI:
             raise HTTPException(403, "invalid operator token")
         return OPERATOR
 
+    private = APIRouter(dependencies=[Depends(require_operator)])
+
+    @public.get("/healthz", status_code=204, response_class=Response)
+    def healthz() -> Response:
+        return Response(status_code=204)  # liveness only: no body, no data
+
     def guarded(fn: Any) -> Any:
         try:
             return fn()
@@ -87,7 +96,7 @@ def create_app(repo: SqliteRepository, environ: Mapping[str, str]) -> FastAPI:
             raise HTTPException(_status_for(exc), str(exc)) from exc
 
     # ---------------------------------------------------------------- read-only
-    @app.get("/v1/status")
+    @private.get("/v1/status")
     def status() -> dict[str, Any]:
         head = repo.head()
         v = repo.verify_chain_with_anchors()
@@ -97,30 +106,30 @@ def create_app(repo: SqliteRepository, environ: Mapping[str, str]) -> FastAPI:
         return {"tasks_by_state": counts, "audit_head_seq": head.seq, "audit_head_hash": head.entry_hash,
                 "audit_chain_ok": v.ok, "anchors_checked": v.anchors_checked, "audit_problems": v.problems}
 
-    @app.get("/v1/tasks")
+    @private.get("/v1/tasks")
     def list_tasks() -> list[dict[str, Any]]:
         return [{"task_id": t.task_id, "state": t.state.value, "role": t.assigned_role.value, "version": t.version,
                  "kind": t.kind.value, "parent_task_id": t.parent_task_id} for t in repo.list_tasks()]
 
-    @app.get("/v1/tasks/{task_id}")
+    @private.get("/v1/tasks/{task_id}")
     def get_task(task_id: str) -> dict[str, Any]:
         t = guarded(lambda: repo.get_task(task_id))
         return {**t.model_dump(mode="json"), "approvals": [a.model_dump(mode="json") for a in repo.list_approvals(task_id)],
                 "runs": [r.model_dump(mode="json") for r in repo.list_runs(task_id)]}
 
-    @app.get("/v1/audit/verify")
+    @private.get("/v1/audit/verify")
     def audit_verify() -> dict[str, Any]:
         v = repo.verify_chain_with_anchors()
         return {"ok": v.ok, "checked": v.chain.checked, "broken_seq": v.chain.broken_seq, "problems": v.problems,
                 "head_seq": v.chain.head_seq, "head_hash": v.chain.head_hash}
 
-    @app.get("/v1/budgets/{budget_id}")
+    @private.get("/v1/budgets/{budget_id}")
     def budget(budget_id: str) -> dict[str, Any]:
         s = guarded(lambda: repo.budget_status(budget_id))
         return {"budget_id": s.budget_id, "limit_usd_micro": s.limit_usd_micro, "used_usd_micro": s.used_usd_micro,
                 "limit_tokens": s.limit_tokens, "used_tokens": s.used_tokens, "state": s.state}
 
-    @app.get("/")
+    @private.get("/")
     def dashboard() -> Any:
         from fastapi.responses import HTMLResponse
 
@@ -131,21 +140,23 @@ def create_app(repo: SqliteRepository, environ: Mapping[str, str]) -> FastAPI:
                             f"<table><tr><th>task</th><th>state</th><th>role</th></tr>{rows}</table>")
 
     # ---------------------------------------------------------------- operator-token mutations
-    @app.post("/v1/tasks", status_code=201)
+    @private.post("/v1/tasks", status_code=201)
     def create_root_task(contract: TaskContract, actor: Annotated[Actor, Depends(require_operator)]) -> dict[str, Any]:
         res = guarded(lambda: repo.create_task(contract, actor))
         return {"task_id": res.task.task_id, "created": res.created, "version": res.task.version}
 
-    @app.post("/v1/approvals/{approval_id}/decision")
+    @private.post("/v1/approvals/{approval_id}/decision")
     def decide(approval_id: str, body: Decision, actor: Annotated[Actor, Depends(require_operator)]) -> dict[str, Any]:
         ap = guarded(lambda: repo.decide_approval(approval_id, body.grant, actor, body.reason))
         return {"approval_id": ap.approval_id, "status": ap.status.value}
 
-    @app.post("/v1/tasks/{task_id}/cancel")
+    @private.post("/v1/tasks/{task_id}/cancel")
     def cancel(task_id: str, body: CancelRequest, actor: Annotated[Actor, Depends(require_operator)]) -> dict[str, Any]:
         t = guarded(lambda: repo.transition(task_id, Event.CANCEL, actor, body.expected_version, reason=body.reason))
         return {"task_id": t.task_id, "state": t.state.value, "version": t.version}
 
+    app.include_router(public)
+    app.include_router(private)
     return app
 
 

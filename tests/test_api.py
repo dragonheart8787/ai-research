@@ -6,7 +6,6 @@ import inspect
 from pathlib import Path
 
 import pytest
-from fastapi.routing import APIRoute
 from fastapi.testclient import TestClient
 
 from airos.agents.adapters import all_mock_adapters
@@ -44,19 +43,18 @@ def test_mutations_require_the_operator_token(client, repo):
 
 
 def test_every_non_get_route_is_operator_protected_and_get_routes_never_mutate(client, repo):
-    routes = [r for r in client.app.routes if isinstance(r, APIRoute)]
-    mutating = [r for r in routes if r.methods - {"GET", "HEAD"}]
-    assert {r.path for r in mutating} == {"/v1/tasks", "/v1/approvals/{approval_id}/decision", "/v1/tasks/{task_id}/cancel"}
-    for r in mutating:
-        assert any(getattr(d.call, "__name__", "") == "require_operator" for d in r.dependant.dependencies), r.path
-        path = r.path.replace("{approval_id}", "a").replace("{task_id}", "t")
-        assert client.post(path, json={}).status_code == 401
+    eps = _endpoints(client.app)
+    mutating = [(m, p) for m, p in eps if m != "GET"]
+    assert {p for _, p in mutating} == {"/v1/tasks", "/v1/approvals/{approval_id}/decision", "/v1/tasks/{task_id}/cancel"}
+    assert all(m == "POST" for m, _ in mutating)
+    for _, p in mutating:
+        assert client.post(_concrete(p), json={}).status_code == 401
     t = repo.create_task(make_contract(), HUMAN).task
     head = repo.head()
-    for r in routes:
-        if r.methods <= {"GET", "HEAD"}:
-            path = r.path.replace("{task_id}", t.task_id).replace("{budget_id}", f"task:{t.task_id}")
-            assert client.get(path).status_code == 200, path
+    for m, p in eps:
+        if m == "GET" and p != "/healthz":
+            path = p.replace("{task_id}", t.task_id).replace("{budget_id}", f"task:{t.task_id}")
+            assert client.get(path, headers=AUTH).status_code == 200, path
     assert repo.head() == head                                              # reading changed nothing
     assert client.put("/v1/tasks", json={}).status_code == 405 and client.delete("/v1/status").status_code == 405
 
@@ -67,7 +65,8 @@ def test_unconfigured_token_fails_closed(repo):
     assert c.post("/v1/tasks", json=_body(make_contract())).status_code == 503
     empty = TestClient(api.create_app(repo, {api.TOKEN_ENV: ""}))
     assert empty.post("/v1/tasks", json=_body(make_contract()), headers={"Authorization": "Bearer "}).status_code in (401, 503)
-    assert c.get("/v1/status").status_code == 200                           # read-only status still works
+    assert c.get("/v1/status", headers=AUTH).status_code == 503                # reads fail closed too when unconfigured
+    assert c.get("/healthz").status_code == 204                                 # the one public endpoint
 
 
 def test_approval_decision_and_cancel_through_the_api(client, repo):
@@ -88,11 +87,11 @@ def test_approval_decision_and_cancel_through_the_api(client, repo):
 
 def test_status_and_audit_endpoints(client, repo):
     t = repo.create_task(make_contract(), HUMAN).task
-    s = client.get("/v1/status").json()
+    s = client.get("/v1/status", headers=AUTH).json()
     assert s["tasks_by_state"] == {"draft": 1} and s["audit_chain_ok"] is True
-    v = client.get("/v1/audit/verify").json()
+    v = client.get("/v1/audit/verify", headers=AUTH).json()
     assert v["ok"] is True and v["head_hash"] == repo.head().entry_hash
-    assert t.task_id in client.get("/").text and "read-only" in client.get("/").text
+    assert t.task_id in client.get("/", headers=AUTH).text and "read-only" in client.get("/", headers=AUTH).text
 
 
 def test_token_is_never_returned_stored_or_logged(client, repo, db_path):
@@ -120,3 +119,58 @@ def test_binds_loopback_by_default_and_refuses_other_hosts(repo):
     for host in ("0.0.0.0", "192.168.1.5", "example.com", ""):       # noqa: S104
         with pytest.raises(ValueError, match="loopback"):
             api.serve(app, host=host)
+
+
+def _endpoints(app):
+    """Every (METHOD, path) the app serves, from the OpenAPI model PLUS the raw included routers (so a route with
+    include_in_schema=False cannot hide)."""
+    found = {(m.upper(), p) for p, ops in app.openapi()["paths"].items() for m in ops if m.upper() not in ("HEAD", "OPTIONS")}
+    for r in app.routes:
+        inner = getattr(r, "original_router", None)
+        for rr in (inner.routes if inner is not None else [r]):
+            for m in getattr(rr, "methods", ()) or ():
+                if m not in ("HEAD", "OPTIONS"):
+                    found.add((m, rr.path))
+    return sorted(found)
+
+
+def _concrete(path):
+    import re as _re
+
+    return _re.sub(r"\{[^}]+\}", "x", path)
+
+
+def test_every_registered_route_rejects_missing_or_wrong_token_except_healthz(repo):
+    """Enumerates what the app actually serves (not a hand-kept list): a route added later is covered automatically."""
+    app = api.create_app(repo, {api.TOKEN_ENV: TOKEN})
+    c = TestClient(app)
+    eps = _endpoints(app)
+    assert ("GET", "/healthz") in eps and ("GET", "/") in eps and ("POST", "/v1/tasks") in eps
+    checked = 0
+    for method, route_path in eps:
+        if route_path == "/healthz":
+            continue
+        path = _concrete(route_path)
+        for headers, code in (({}, 401), ({"Authorization": "Bearer wrong"}, 403), ({"Authorization": "Basic x"}, 401),
+                              ({"Authorization": f"Bearer {TOKEN}x"}, 403)):
+            resp = c.request(method, path, headers=headers, json={} if method == "POST" else None)
+            assert resp.status_code == code, (method, route_path, headers, resp.status_code)
+        checked += 1
+    assert checked >= 9                                   # 6 GET + 3 POST
+    assert repo.list_tasks() == []                        # the rejected requests changed nothing
+
+
+def test_unconfigured_token_makes_every_non_healthz_endpoint_fail_closed(repo):
+    app = api.create_app(repo, {})
+    c = TestClient(app)
+    for method, route_path in _endpoints(app):
+        want = 204 if route_path == "/healthz" else 503
+        assert c.request(method, _concrete(route_path), json={} if method == "POST" else None).status_code == want, route_path
+
+
+def test_healthz_is_public_and_returns_no_data(repo):
+    for env in ({api.TOKEN_ENV: TOKEN}, {}):
+        c = TestClient(api.create_app(repo, env))
+        r = c.get("/healthz")
+        assert r.status_code == 204 and r.content == b""
+        assert c.post("/healthz").status_code == 405           # GET only
