@@ -9,7 +9,7 @@ from collections.abc import Iterator
 from dataclasses import dataclass, field
 from typing import Protocol
 
-from airos.audit import ChainVerification
+from airos.audit import AnchorVerification, ChainVerification
 from airos.domain.guards import GuardContext
 from airos.domain.schemas import (
     Approval,
@@ -88,6 +88,7 @@ class AuditRepository(Protocol):
     def head(self) -> AuditHead: ...
     def iter_events(self, from_seq: int = 1) -> Iterator[AuditEvent]: ...
     def verify_chain(self) -> ChainVerification: ...
+    def verify_chain_with_anchors(self) -> AnchorVerification: ...
 
 
 class ArtifactRepository(Protocol):

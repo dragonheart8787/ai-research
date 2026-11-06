@@ -67,7 +67,9 @@ def test_reopen_is_idempotent_for_migrations(open_repo, db_path):
     open_repo().close()
     r = SqliteRepository(db_path)
     n = r._conn().execute("SELECT COUNT(*) FROM schema_migrations").fetchone()[0]
-    assert n == 1
+    from importlib import resources
+    files = [e for e in resources.files('airos.persistence').joinpath('migrations').iterdir() if e.name.endswith('.sql')]
+    assert n == len(files) >= 2
     r.close()
 
 

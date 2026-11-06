@@ -50,13 +50,14 @@ def make_contract(**over: object) -> TaskContract:
 
 def free_contract(**over: object) -> TaskContract:
     """Zero-cost, side-effect-free, non-executor task: auto-approvable."""
-    return make_contract(
-        assigned_role=Role.PLANNER,
-        resource_limits=ResourceLimits(max_usd_micro=0, max_retries=2),
-        approval_requirements=[],
-        allowed_actions=[],
-        **over,
-    )
+    base: dict[str, object] = {
+        "assigned_role": Role.PLANNER,
+        "resource_limits": ResourceLimits(max_usd_micro=0, max_retries=2),
+        "approval_requirements": [],
+        "allowed_actions": [],
+    }
+    base.update(over)
+    return make_contract(**base)
 
 
 @pytest.fixture

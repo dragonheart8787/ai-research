@@ -72,10 +72,9 @@ def test_recovery_is_deterministic_and_idempotent(repo, clock):
         t = repo.create_task(make_contract(), HUMAN).task
         _, rid = to_running(repo, t, worker="w1")
         ids.append(rid)
-        clock.advance(1)  # distinct start times; ties would be broken by run_id (also deterministic)
     clock.advance(LEASE)
     first = repo.recover_leases()
-    assert [a.run_id for a in first.actions] == ids   # ordered by start time then id
+    assert [a.run_id for a in first.actions] == ids   # same start ms for every run: order = run_seq (creation order)
     assert repo.recover_leases().actions == []
 
 
@@ -179,3 +178,49 @@ def test_timestamps_come_from_injected_clock(repo, clock):
     t = repo.create_task(make_contract(), HUMAN).task
     assert t.created_at_ms == clock.now_ms()
     assert all(e.ts_ms == clock.now_ms() for e in repo.iter_events())
+
+
+def test_recovery_order_is_run_seq_not_run_id_and_identical_for_identical_state(open_repo, db_path, clock, tmp_path):
+    """Descending run ids would reverse a run_id tiebreak. Two recoveries over identical DB state must agree."""
+    import itertools
+    import sqlite3
+
+    from airos.persistence.sqlite_repo import SqliteRepository
+
+    counter = itertools.count(10_000, -1)  # ids sort in REVERSE creation order
+    repo = open_repo(id_factory=lambda: f"id-{next(counter):08d}", limits=Limits(max_concurrent_runs=10))
+    started = []
+    for _ in range(5):
+        t = repo.create_task(make_contract(), HUMAN).task
+        _, rid = to_running(repo, t)
+        started.append(rid)
+    assert started != sorted(started)  # precondition: lexical order differs from creation order
+    clock.advance(LEASE)
+
+    clone_path = tmp_path / "clone.db"
+    src = sqlite3.connect(db_path)
+    dst = sqlite3.connect(clone_path)
+    src.backup(dst)  # byte-for-byte equal logical state
+    src.close()
+    dst.close()
+    clone = SqliteRepository(clone_path, clock=clock)
+
+    a = [x.run_id for x in repo.recover_leases().actions]
+    b = [x.run_id for x in clone.recover_leases().actions]
+    clone.close()
+    assert a == started          # creation (run_seq) order, not lexical run_id order
+    assert a == b                # deterministic for identical state
+
+
+def test_run_seq_is_enforced_by_the_database(repo, db_path):
+    import sqlite3
+
+    t = repo.create_task(make_contract(), HUMAN).task
+    _, rid = to_running(repo, t)
+    raw = sqlite3.connect(db_path, isolation_level=None)
+    with pytest.raises(sqlite3.DatabaseError, match="immutable"):
+        raw.execute("UPDATE runs SET run_seq=run_seq+100 WHERE run_id=?", (rid,))
+    with pytest.raises(sqlite3.DatabaseError, match="increasing"):
+        raw.execute("INSERT INTO runs(run_id,task_id,attempt,agent_id,state,lease_owner,lease_expires_at_ms,heartbeat_at_ms,"
+                    "started_at_ms,run_seq) VALUES('x',?,9,'executor-1','abandoned','w',1,1,1,1)", (t.task_id,))
+    raw.close()

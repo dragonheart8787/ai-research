@@ -9,7 +9,7 @@ import pytest
 from airos.audit import GENESIS_HASH, compute_entry_hash, verify_rows
 from airos.domain.states import Event
 from airos.errors import GuardFailed
-from tests.conftest import DIRECTOR, HUMAN, approve_fully, make_contract, to_running
+from tests.conftest import DIRECTOR, HUMAN, PLANNER, approve_fully, make_contract, to_running
 
 VECTORS = Path(__file__).parent / "vectors" / "audit_chain.json"
 
@@ -117,19 +117,63 @@ def test_tamper_rehashed_entry_breaks_next_link(repo, db_path):
     assert not v.ok and v.broken_seq == K + 1 and "prev_hash" in v.reason
 
 
-def test_tamper_truncated_tail_is_detected_via_anchor(repo, db_path, tmp_path):
-    """Truncation leaves a valid shorter chain; only the external anchor exposes it (documented limit)."""
+def _anchored_repo(repo):
     t = repo.create_task(make_contract(), HUMAN).task
-    t = approve_fully(repo, t)  # decisions append anchors
-    anchor_lines = (tmp_path / "anchors" / "audit-anchors.log").read_text().strip().splitlines()
-    last_anchor_seq = int(anchor_lines[-1].split("\t")[1])
+    approve_fully(repo, t)  # two human grants -> two anchors
+    assert repo.verify_chain_with_anchors().ok
+    return t
+
+
+def test_anchor_verification_passes_on_untouched_log(repo):
+    _anchored_repo(repo)
+    v = repo.verify_chain_with_anchors()
+    assert v.ok and v.anchors_checked == 2 and v.problems == []
+
+
+def test_anchor_verification_detects_tail_truncation(repo, db_path):
+    """The chain alone cannot see truncation (it stays internally valid); the anchor file does."""
+    _anchored_repo(repo)
+    last_anchor_seq = int(repo.anchor_path.read_text().strip().splitlines()[-1].split("\t")[1])
     raw = _raw(db_path)
     raw.execute("DROP TRIGGER task_events_no_delete")
-    raw.execute("DELETE FROM task_events WHERE seq > ?", (last_anchor_seq - 2,))
+    raw.execute("DELETE FROM task_events WHERE seq >= ?", (last_anchor_seq,))
     raw.close()
-    v = repo.verify_chain()
-    assert v.ok  # chain alone cannot see truncation ...
-    assert v.head_seq < last_anchor_seq  # ... but the anchor file proves the log is shorter than it was
+    assert repo.verify_chain().ok                       # internally consistent shorter chain ...
+    v = repo.verify_chain_with_anchors()
+    assert not v.ok and any("truncated" in p and str(last_anchor_seq) in p for p in v.problems)
+
+
+def test_anchor_verification_detects_whole_chain_rewrite_with_different_head(repo, db_path):
+    """Attacker rewrites event 1 and recomputes EVERY later hash: chain is valid, head differs, anchors expose it."""
+    from airos.audit import entry_material
+
+    _anchored_repo(repo)
+    old_head = repo.head()
+    raw = _raw(db_path)
+    raw.row_factory = sqlite3.Row
+    raw.execute("DROP TRIGGER task_events_no_update")
+    rows = [dict(r) for r in raw.execute("SELECT * FROM task_events ORDER BY seq")]
+    rows[0]["payload_json"] = '{"rewritten":true}'
+    prev = rows[0]["prev_hash"]
+    for r in rows:
+        r["prev_hash"] = prev
+        r["entry_hash"] = compute_entry_hash(prev, entry_material(r))
+        prev = r["entry_hash"]
+        raw.execute("UPDATE task_events SET payload_json=?, prev_hash=?, entry_hash=? WHERE seq=?",
+                    (r["payload_json"], r["prev_hash"], r["entry_hash"], r["seq"]))
+    raw.close()
+    assert repo.verify_chain().ok                        # a perfectly consistent forged chain ...
+    assert repo.head().entry_hash != old_head.entry_hash  # ... with a different head
+    v = repo.verify_chain_with_anchors()
+    assert not v.ok and any("rewritten" in p for p in v.problems)
+
+
+def test_anchor_file_malformed_line_is_a_problem_not_ignored(repo):
+    _anchored_repo(repo)
+    with open(repo.anchor_path, "a") as f:
+        f.write("garbage line\n")
+    v = repo.verify_chain_with_anchors()
+    assert not v.ok and any("malformed" in p for p in v.problems)
 
 
 def test_anchor_written_on_human_approval_and_root_completion_only(repo, tmp_path):
@@ -189,3 +233,34 @@ def test_published_test_vectors_reproduce():
     assert verify_rows(rows).ok
     rows[1]["actor_id"] = "x"
     assert verify_rows(rows).broken_seq == 2
+
+
+def test_anchor_written_on_root_objective_completion(repo, tmp_path):
+    from airos.domain.guards import GuardContext
+    from airos.domain.schemas import Role, TaskKind
+    from airos.domain.states import RunState
+    from airos.persistence.sqlite_repo import SYSTEM
+    from tests.conftest import EXECUTOR, free_contract
+
+    anchor = tmp_path / "anchors" / "audit-anchors.log"
+    root = repo.create_task(free_contract(kind=TaskKind.OBJECTIVE, assigned_role=Role.DIRECTOR), HUMAN).task
+    child = repo.create_task(make_contract(), PLANNER, root.task_id).task
+    child = approve_fully(repo, child)
+    child = repo.transition(child.task_id, Event.QUEUE, SYSTEM, child.version)
+    run = repo.start_run(child.task_id, "w1", EXECUTOR.id, child.version, GuardContext(budget_reserved=True))
+    child = repo.complete_run(run.run_id, "w1", RunState.SUCCEEDED, verifier_passed=True)
+    child = repo.transition(child.task_id, Event.ACCEPT, DIRECTOR, child.version)
+    assert child.state.value == "completed"
+    assert not anchor.exists() or all(ln.split("\t")[3] == "approval.granted" for ln in anchor.read_text().splitlines())
+    n_before = len(anchor.read_text().splitlines())          # child completion is NOT a root completion
+    root = repo.transition(root.task_id, Event.PLAN, PLANNER, root.version, GuardContext(plan_ok=True))
+    root = repo.transition(root.task_id, Event.AUTO_APPROVE, SYSTEM, root.version)
+    root = repo.transition(root.task_id, Event.QUEUE, SYSTEM, root.version)
+    root = repo.transition(root.task_id, Event.START, SYSTEM, root.version, GuardContext(budget_reserved=True))
+    root = repo.transition(root.task_id, Event.FINISH, SYSTEM, root.version)
+    assert len(anchor.read_text().splitlines()) == n_before  # reaching review is not completion either
+    root = repo.transition(root.task_id, Event.ACCEPT, HUMAN, root.version)
+    lines = anchor.read_text().splitlines()
+    assert root.state.value == "completed" and len(lines) == n_before + 1
+    assert lines[-1].split("\t")[3] == "task.transition" and lines[-1].split("\t")[2] == repo.head().entry_hash
+    assert repo.verify_chain_with_anchors().ok

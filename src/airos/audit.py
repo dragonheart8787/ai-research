@@ -62,3 +62,55 @@ def verify_rows(rows: Iterable[Mapping[str, Any]]) -> ChainVerification:
             return ChainVerification(False, checked, seq, "entry_hash mismatch (entry content was altered)", prev_seq, prev_hash)
         prev_hash, prev_seq, checked = row["entry_hash"], seq, checked + 1
     return ChainVerification(True, checked, None, None, prev_seq, prev_hash)
+
+
+@dataclass(frozen=True)
+class AnchorLine:
+    ts_ms: int
+    seq: int
+    entry_hash: str
+    event_type: str
+
+
+def parse_anchor_lines(text: str) -> tuple[list[AnchorLine], list[str]]:
+    """Parse the anchor file. Returns (anchors, problems); malformed lines are problems, never ignored."""
+    anchors: list[AnchorLine] = []
+    problems: list[str] = []
+    for n, line in enumerate(text.splitlines(), 1):
+        if not line.strip():
+            continue
+        parts = line.split("\t")
+        try:
+            ts, seq, h, typ = parts
+            if len(h) != 64 or int(seq) < 1:
+                raise ValueError
+            anchors.append(AnchorLine(int(ts), int(seq), h, typ))
+        except ValueError:
+            problems.append(f"anchor file line {n} is malformed")
+    return anchors, problems
+
+
+@dataclass(frozen=True)
+class AnchorVerification:
+    ok: bool
+    chain: ChainVerification
+    anchors_checked: int
+    problems: list[str]
+
+
+def verify_against_anchors(chain: ChainVerification, hashes_by_seq: Mapping[int, str], anchor_text: str) -> AnchorVerification:
+    """Cross-check the chain with the externally stored anchors.
+
+    Detects (1) tail truncation: an anchored seq is beyond the chain head, and (2) whole-chain rewrite:
+    the entry stored at an anchored seq no longer has the anchored hash, even when the rewritten chain is
+    internally consistent. Cannot detect tampering of the anchor file itself (it lives on a separate volume).
+    """
+    anchors, problems = parse_anchor_lines(anchor_text)
+    if not chain.ok:
+        problems.append(f"chain invalid at seq {chain.broken_seq}: {chain.reason}")
+    for a in anchors:
+        if a.seq > chain.head_seq:
+            problems.append(f"truncated: anchor seq {a.seq} is beyond chain head seq {chain.head_seq}")
+        elif hashes_by_seq.get(a.seq) != a.entry_hash:
+            problems.append(f"rewritten: entry hash at seq {a.seq} differs from the anchored hash")
+    return AnchorVerification(not problems, chain, len(anchors), problems)

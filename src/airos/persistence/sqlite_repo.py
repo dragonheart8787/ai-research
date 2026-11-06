@@ -16,7 +16,14 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
-from airos.audit import GENESIS_HASH, ChainVerification, compute_entry_hash, verify_rows
+from airos.audit import (
+    GENESIS_HASH,
+    AnchorVerification,
+    ChainVerification,
+    compute_entry_hash,
+    verify_against_anchors,
+    verify_rows,
+)
 from airos.canonical import canonical_json
 from airos.clock import Clock, SystemClock
 from airos.domain.guards import Facts, GuardContext, GuardInput, run_guard
@@ -239,6 +246,15 @@ class SqliteRepository:
     def verify_chain(self) -> ChainVerification:
         rows = (dict(r) for r in self._read().execute("SELECT * FROM task_events ORDER BY seq"))
         return verify_rows(rows)
+
+    def verify_chain_with_anchors(self) -> AnchorVerification:
+        """verify_chain() plus cross-check against the anchor file (detects truncation and whole-chain rewrite)."""
+        chain = self.verify_chain()
+        hashes = {r["seq"]: r["entry_hash"] for r in self._read().execute("SELECT seq, entry_hash FROM task_events")}
+        text = ""
+        if self.anchor_path is not None and self.anchor_path.exists():
+            text = self.anchor_path.read_text(encoding="utf-8")
+        return verify_against_anchors(chain, hashes, text)
 
     # ------------------------------------------------------------ principals / authz
 
@@ -656,8 +672,8 @@ class SqliteRepository:
             conn.execute("UPDATE tasks SET attempt_count=? WHERE task_id=?", (attempt, task_id))
             run_id = self._new_id()
             conn.execute(
-                "INSERT INTO runs(run_id,task_id,attempt,agent_id,state,lease_owner,lease_expires_at_ms,heartbeat_at_ms,started_at_ms)"
-                " VALUES(?,?,?,?,'running',?,?,?,?)",
+                "INSERT INTO runs(run_id,task_id,attempt,agent_id,state,lease_owner,lease_expires_at_ms,heartbeat_at_ms,started_at_ms,run_seq)"
+                " VALUES(?,?,?,?,'running',?,?,?,?,(SELECT COALESCE(MAX(run_seq),0)+1 FROM runs))",
                 (run_id, task_id, attempt, agent_id, worker_id, now + self.limits.lease_ttl_ms, now, now),
             )
             self._append_event(conn, "run.started", SYSTEM, task_id=task_id, run_id=run_id,
@@ -711,7 +727,7 @@ class SqliteRepository:
         now = self.clock.now_ms()
         ids = [r[0] for r in self._read().execute(
             "SELECT run_id FROM runs WHERE state='running' AND (lease_expires_at_ms<=? OR (? IS NOT NULL AND lease_owner<>?)) "
-            "ORDER BY started_at_ms, run_id", (now, current_worker_id, current_worker_id))]
+            "ORDER BY run_seq", (now, current_worker_id, current_worker_id))]
         actions: list[RecoveryAction] = []
         for run_id in ids:
             with self._tx() as conn:
