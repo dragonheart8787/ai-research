@@ -287,3 +287,22 @@ def test_unknown_artifact_and_ids_are_not_denials(repo, svc):
     with pytest.raises(NotFound):
         svc.read(EXECUTOR, "does-not-exist")
     assert uuid.uuid4() and Event.CANCEL and RunState.FAILED and GuardContext() and ResourceLimits()
+
+
+@pytest.mark.parametrize("claimed", [TrustLevel.TRUSTED, TrustLevel.REVIEWED, TrustLevel.UNTRUSTED, TrustLevel.QUARANTINED])
+def test_scientist_output_is_always_quarantined_never_plain_untrusted_whatever_the_caller_claims(repo, claimed):
+    t, run = _running(repo, Role.AI_SCIENTIST, SCI)
+    art = repo.add_artifact(Artifact(
+        artifact_id=f"sci-{claimed.value}", sha256="c" * 64, size_bytes=1, media_type="t/p",
+        artifact_class=ArtifactClass.SCIENTIST_OUTPUT, logical_name="n", storage_uri="x", producer_run_id=run.run_id,
+        trust_level=claimed, created_at_ms=1), SYSTEM)
+    assert art.trust_level is TrustLevel.QUARANTINED
+    assert repo.get_artifact(art.artifact_id).trust_level is TrustLevel.QUARANTINED
+    # a human-imported scientist output is quarantined too (manual handoff path)
+    assert repo.get_artifact(art.artifact_id).artifact_class is ArtifactClass.SCIENTIST_OUTPUT
+
+
+def test_human_import_of_scientist_output_is_quarantined(svc):
+    art = svc.import_bytes(data=b"s", artifact_id="sci-h", logical_name="s.txt", media_type="text/plain",
+                           artifact_class=ArtifactClass.SCIENTIST_OUTPUT, human=HUMAN)
+    assert art.trust_level is TrustLevel.QUARANTINED
