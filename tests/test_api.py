@@ -50,10 +50,14 @@ def test_every_non_get_route_is_operator_protected_and_get_routes_never_mutate(c
     for _, p in mutating:
         assert client.post(_concrete(p), json={}).status_code == 401
     t = repo.create_task(make_contract(), HUMAN).task
+    t = repo.transition(t.task_id, Event.PLAN, PLANNER, t.version, GuardContext(plan_ok=True))
+    t = repo.transition(t.task_id, Event.REQUIRE_APPROVAL, SYSTEM, t.version)
+    ap = repo.request_approval(t.task_id, ApprovalType.COST, SYSTEM)
     head = repo.head()
     for m, p in eps:
         if m == "GET" and p != "/healthz":
-            path = p.replace("{task_id}", t.task_id).replace("{budget_id}", f"task:{t.task_id}")
+            path = (p.replace("{task_id}", t.task_id).replace("{budget_id}", f"task:{t.task_id}")
+                    .replace("{approval_id}", ap.approval_id))
             assert client.get(path, headers=AUTH).status_code == 200, path
     assert repo.head() == head                                              # reading changed nothing
     assert client.put("/v1/tasks", json={}).status_code == 405 and client.delete("/v1/status").status_code == 405

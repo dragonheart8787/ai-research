@@ -8,7 +8,7 @@ from __future__ import annotations
 from enum import Enum
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, computed_field, field_validator, model_validator
 
 from airos.canonical import canonical_json, sha256_hex
 from airos.domain.states import (
@@ -133,6 +133,15 @@ class ExpectedOutput(StrictModel):
     max_bytes: int = Field(25 * 1024 * 1024, ge=1, le=256 * 1024 * 1024)
 
 
+def worst_case_total_usd_micro(limits: ResourceLimits) -> int:
+    """Everything the task may cost if every permitted attempt runs to its cap: cap x (1 + max_retries)."""
+    return limits.max_usd_micro * (1 + limits.max_retries)
+
+
+def worst_case_total_tokens(limits: ResourceLimits) -> int:
+    return limits.max_tokens * (1 + limits.max_retries)
+
+
 def required_approval_types(
     assigned_role: Role, side_effect_class: SideEffectClass, max_usd_micro: int
 ) -> set[ApprovalType]:
@@ -168,6 +177,30 @@ class TaskContract(StrictModel):
     human_review_required: bool = False
     # Actions the executor may take. Derived ONLY from this approved contract (PROPOSAL 11.4).
     allowed_actions: list[str] = Field(default_factory=list)
+
+    @model_validator(mode="before")
+    @classmethod
+    def _worst_case_is_derived(cls, data: Any) -> Any:
+        """worst_case_* are DERIVED (and hashed). An inbound value must equal the derived one; it is never trusted."""
+        if isinstance(data, dict) and ("worst_case_total_usd_micro" in data or "worst_case_total_tokens" in data):
+            data = dict(data)
+            rl = data.get("resource_limits")
+            limits = rl if isinstance(rl, ResourceLimits) else ResourceLimits.model_validate(rl or {})
+            for key, want in (("worst_case_total_usd_micro", worst_case_total_usd_micro(limits)),
+                              ("worst_case_total_tokens", worst_case_total_tokens(limits))):
+                if key in data and data.pop(key) != want:
+                    raise ValueError(f"{key} does not equal per-attempt cap x (1 + max_retries) = {want}")
+        return data
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def worst_case_total_usd_micro(self) -> int:
+        return worst_case_total_usd_micro(self.resource_limits)
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def worst_case_total_tokens(self) -> int:
+        return worst_case_total_tokens(self.resource_limits)
 
     @field_validator("allowed_actions")
     @classmethod
@@ -411,6 +444,8 @@ class Approval(StrictModel):
     budget_id: str | None = None  # only for budget_increase approvals
     amount_usd_micro: int | None = None
     amount_tokens: int | None = None
+    worst_case_total_usd_micro: int | None = None  # what the approved contract may cost in total (cap x attempts)
+    worst_case_total_tokens: int | None = None
 
 
 class LedgerKind(str, Enum):

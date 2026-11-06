@@ -66,6 +66,14 @@ def _status_for(exc: AirosError) -> int:
     return 400
 
 
+def _approval_view(ap: Any) -> dict[str, Any]:
+    """What a human needs to see before granting: the binding AND the worst-case total they are approving."""
+    return {"approval_id": ap.approval_id, "status": ap.status.value, "approval_type": ap.approval_type.value,
+            "task_id": ap.task_id, "task_version": ap.task_version, "contract_sha256": ap.contract_sha256,
+            "worst_case_total_usd_micro": ap.worst_case_total_usd_micro,
+            "worst_case_total_tokens": ap.worst_case_total_tokens, "expires_at_ms": ap.expires_at_ms}
+
+
 def create_app(repo: SqliteRepository, environ: Mapping[str, str]) -> FastAPI:
     token = environ.get(TOKEN_ENV, "")
     token_digest = hashlib.sha256(token.encode()).digest() if token else None
@@ -140,15 +148,22 @@ def create_app(repo: SqliteRepository, environ: Mapping[str, str]) -> FastAPI:
                             f"<table><tr><th>task</th><th>state</th><th>role</th></tr>{rows}</table>")
 
     # ---------------------------------------------------------------- operator-token mutations
+    @private.get("/v1/approvals/{approval_id}")
+    def get_approval(approval_id: str) -> dict[str, Any]:
+        return _approval_view(guarded(lambda: repo.get_approval(approval_id)))
+
     @private.post("/v1/tasks", status_code=201)
     def create_root_task(contract: TaskContract, actor: Annotated[Actor, Depends(require_operator)]) -> dict[str, Any]:
         res = guarded(lambda: repo.create_task(contract, actor))
-        return {"task_id": res.task.task_id, "created": res.created, "version": res.task.version}
+        return {"task_id": res.task.task_id, "created": res.created, "version": res.task.version,
+                "contract_sha256": res.task.contract_sha256,
+                "worst_case_total_usd_micro": res.task.contract.worst_case_total_usd_micro,
+                "worst_case_total_tokens": res.task.contract.worst_case_total_tokens}
 
     @private.post("/v1/approvals/{approval_id}/decision")
     def decide(approval_id: str, body: Decision, actor: Annotated[Actor, Depends(require_operator)]) -> dict[str, Any]:
         ap = guarded(lambda: repo.decide_approval(approval_id, body.grant, actor, body.reason))
-        return {"approval_id": ap.approval_id, "status": ap.status.value}
+        return _approval_view(ap)
 
     @private.post("/v1/tasks/{task_id}/cancel")
     def cancel(task_id: str, body: CancelRequest, actor: Annotated[Actor, Depends(require_operator)]) -> dict[str, Any]:

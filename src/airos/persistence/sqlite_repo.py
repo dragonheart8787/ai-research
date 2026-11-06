@@ -699,7 +699,14 @@ class SqliteRepository:
             status=ApprovalStatus(r["status"]), requested_by=r["requested_by"], requested_at_ms=r["requested_at_ms"],
             expires_at_ms=r["expires_at_ms"], decided_by=r["decided_by"], decided_at_ms=r["decided_at_ms"], reason=r["reason"],
             budget_id=r["budget_id"], amount_usd_micro=r["amount_usd_micro"], amount_tokens=r["amount_tokens"],
+            worst_case_total_usd_micro=r["worst_case_usd_micro"], worst_case_total_tokens=r["worst_case_tokens"],
         )
+
+    def get_approval(self, approval_id: str) -> Approval:
+        row = self._read().execute("SELECT * FROM approvals WHERE approval_id=?", (approval_id,)).fetchone()
+        if row is None:
+            raise NotFound(f"approval {approval_id!r}")
+        return self._row_to_approval(row)
     def request_approval(self, task_id: str, approval_type: ApprovalType, requested_by: Actor) -> Approval:
         with self._denial_scope(requested_by, "approval.request", task_id):
             return self._request_approval(task_id, approval_type, requested_by)
@@ -723,9 +730,10 @@ class SqliteRepository:
             aid = self._new_id()
             conn.execute(
                 "INSERT INTO approvals(approval_id,task_id,task_version,contract_sha256,approval_type,status,requested_by,"
-                "requested_at_ms,expires_at_ms) VALUES(?,?,?,?,?,'pending',?,?,?)",
+                "requested_at_ms,expires_at_ms,worst_case_usd_micro,worst_case_tokens) VALUES(?,?,?,?,?,'pending',?,?,?,?,?)",
                 (aid, task_id, task.contract_version, task.contract_sha256, approval_type.value, requested_by.id, now,
-                 now + self.limits.approval_ttl_ms),
+                 now + self.limits.approval_ttl_ms, task.contract.worst_case_total_usd_micro,
+                 task.contract.worst_case_total_tokens),
             )
             self._append_event(
                 conn, "approval.requested", requested_by, task_id=task_id,
@@ -1100,9 +1108,11 @@ class SqliteRepository:
             aid = self._new_id()
             conn.execute(
                 "INSERT INTO approvals(approval_id,task_id,task_version,contract_sha256,approval_type,status,requested_by,"
-                "requested_at_ms,expires_at_ms,budget_id,amount_usd_micro,amount_tokens) VALUES(?,?,?,?,'budget_increase','pending',?,?,?,?,?,?)",
+                "requested_at_ms,expires_at_ms,budget_id,amount_usd_micro,amount_tokens,worst_case_usd_micro,worst_case_tokens)"
+                " VALUES(?,?,?,?,'budget_increase','pending',?,?,?,?,?,?,?,?)",
                 (aid, task_id, task.contract_version, task.contract_sha256, requested_by.id, now,
-                 now + self.limits.approval_ttl_ms, budget_id, usd_micro, tokens))
+                 now + self.limits.approval_ttl_ms, budget_id, usd_micro, tokens, task.contract.worst_case_total_usd_micro,
+                 task.contract.worst_case_total_tokens))
             self._append_event(conn, "approval.requested", requested_by, task_id=task_id, payload={
                 "approval_id": aid, "approval_type": "budget_increase", "budget_id": budget_id, "usd_micro": usd_micro,
                 "tokens": tokens, "task_version": task.contract_version, "contract_sha256": task.contract_sha256})
