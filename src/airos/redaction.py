@@ -34,6 +34,9 @@ class Redactor:
         for s in secrets:
             self.register_secret(s)
 
+    def __repr__(self) -> str:
+        return f"Redactor(<{len(self._secrets)} registered secret(s)>)"
+
     @classmethod
     def from_environ(cls, names: Iterable[str]) -> Redactor:
         return cls(os.environ[n] for n in names if os.environ.get(n))

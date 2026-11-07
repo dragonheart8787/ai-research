@@ -1,0 +1,23 @@
+{
+  "name": "anthropic messages: success",
+  "provenance": "synthetic: modelled on the documented response shape; NOT a live recording",
+  "request": {
+    "method": "POST",
+    "url": "https://api.anthropic.com/v1/messages",
+    "headers_present": ["x-api-key", "anthropic-version", "content-type"],
+    "body_json_subset": {"model": "claude-test", "messages": [{"role": "user"}]}
+  },
+  "response": {
+    "status": 200,
+    "headers": {"content-type": "application/json"},
+    "body": {
+      "id": "msg_synthetic_1",
+      "type": "message",
+      "role": "assistant",
+      "model": "claude-test",
+      "content": [{"type": "text", "text": "[SYNTHETIC] Plan: 1) gather 2) analyse 3) report."}],
+      "stop_reason": "end_turn",
+      "usage": {"input_tokens": 200, "output_tokens": 40}
+    }
+  }
+}

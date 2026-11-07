@@ -10,12 +10,22 @@ import time
 import uuid
 from dataclasses import dataclass, field
 
+from pydantic import ValidationError
+
+from airos.agents.real.common import AdapterProtocolError
 from airos.agents.registry import AgentRegistry
 from airos.agents.runner import Runner
 from airos.artifacts import ArtifactService
 from airos.domain.guards import GuardContext
-from airos.domain.schemas import ErrorRecord, ResourceUsage, TaskKind, TaskRecord, build_agent_request
-from airos.domain.states import BlockReason, Event, RunState, TaskState
+from airos.domain.schemas import (
+    AgentResponse,
+    ErrorRecord,
+    ResourceUsage,
+    TaskKind,
+    TaskRecord,
+    build_agent_request,
+)
+from airos.domain.states import Actor, ActorKind, BlockReason, Event, RunState, TaskState
 from airos.errors import (
     AdapterUnavailable,
     AirosError,
@@ -29,6 +39,8 @@ from airos.errors import (
 from airos.persistence.interfaces import RecoveryReport
 from airos.persistence.sqlite_repo import SYSTEM, SqliteRepository
 from airos.verifier import verify_response
+
+MAX_RESPONSE_BYTES = 1 * 1024 * 1024
 
 
 class AdapterTimeout(AirosError):
@@ -99,6 +111,14 @@ class Worker:
         self.sweep_timeouts()
         self.repo.time_out_expired_runs()  # hard per-run limit, independent of any adapter or worker
         for t in self.repo.list_tasks(TaskState.APPROVED):
+            if t.kind is TaskKind.WORK:
+                try:
+                    self.registry.route(self.repo, t)  # availability first: audited refusal BEFORE any budget is touched
+                except AdapterUnavailable as exc:
+                    self.repo.transition(t.task_id, Event.BLOCK, SYSTEM, t.version,
+                                         GuardContext(block_reason=BlockReason.ADAPTER_UNAVAILABLE), reason=str(exc))
+                    rep.blocked_unroutable.append(t.task_id)
+                    continue
             try:
                 out = self.repo.queue_task(t.task_id, t.version)
             except (GuardFailed, VersionConflict):
@@ -152,13 +172,13 @@ class Worker:
             if thread.is_alive() and not self.repo.heartbeat(run_id, self.worker_id):
                 return
 
-    def _call_adapter(self, adapter, request, workdir, timeout_s: int):  # type: ignore[no-untyped-def]
+    def _call_adapter(self, adapter, request, workdir, timeout_s: int, inputs=None):  # type: ignore[no-untyped-def]
         """Run the adapter in a daemon thread so a hung adapter cannot hang the worker past the wall-clock limit."""
         box: dict[str, object] = {}
 
         def target() -> None:
             try:
-                box["response"] = adapter.execute(request, workdir)
+                box["response"] = adapter.execute(request, workdir) if adapter.is_mock else adapter.execute(request, workdir, inputs)
             except BaseException as exc:  # noqa: BLE001
                 box["error"] = exc
 
@@ -170,6 +190,21 @@ class Worker:
         if "error" in box:
             raise box["error"]  # type: ignore[misc]
         return box["response"]
+
+    def _audit(self, event_type: str, task: TaskRecord, payload: dict[str, object]) -> None:
+        with contextlib.suppress(AirosError):
+            self.repo.record_system_event(event_type, payload, task.task_id)
+
+    def _reject(self, task: TaskRecord, run_id: str, category: str, detail: str, usage: ResourceUsage | None, adapter) -> None:  # type: ignore[no-untyped-def]
+        """Fail closed on a bad adapter response and AUDIT it. Malformed / missing-artifact / schema failures are retried once
+        per task (PROPOSAL); hash mismatches, oversize, policy violations and handoff problems are never retried."""
+        self._audit("adapter.response_rejected", task, {"role": task.assigned_role.value, "category": category,
+                                                        "detail": detail[:1000], "mock": adapter.is_mock, "run_id": run_id})
+        error_class = {"hash_mismatch": "hash_mismatch", "handoff_invalid": "handoff_invalid", "malformed": "schema_violation",
+                       "missing_artifact": "schema_violation", "schema": "schema_violation"}.get(category, "policy")
+        prior = sum(e.error_class == "schema_violation" for e in task.error_history)
+        retryable = error_class == "schema_violation" and prior == 0
+        self._fail(run_id, retryable=retryable, error_class=error_class, detail=f"{category}: {detail}", usage=usage)
 
     def _fail(self, run_id: str, *, retryable: bool, error_class: str, detail: str, usage: ResourceUsage | None = None) -> None:
         err = ErrorRecord(ts_ms=self.repo.clock.now_ms(), attempt=0, error_class=error_class,
@@ -183,12 +218,20 @@ class Worker:
                                       lease_expires_at_ms=lease_expires)
         if not self.repo.heartbeat(run_id, self.worker_id):
             return
+        agent = Actor(ActorKind(task.assigned_role.value), f"{task.assigned_role.value}-1")
+
+        def read_input(artifact_id: str) -> bytes:  # the adapter can read ONLY what this agent role may read (pinned inputs)
+            return self.artifacts.read(agent, artifact_id, for_task_id=task.task_id)
+
         try:
-            response = self._call_adapter(adapter, request, workdir, task.contract.resource_limits.wall_clock_s)
+            response = self._call_adapter(adapter, request, workdir, task.contract.resource_limits.wall_clock_s, read_input)
         except AdapterTimeout:
             # Hard limit enforced by the control plane: the adapter cannot extend, ignore or outlive it.
             with contextlib.suppress(GuardFailed, LeaseLost):
                 self.repo.time_out_run(run_id)
+            return
+        except AdapterProtocolError as exc:
+            self._reject(task, run_id, exc.category, exc.detail, None, adapter)
             return
         except Exception as exc:  # adapter crash: transient, retried within limits
             self._fail(run_id, retryable=True, error_class="adapter_error", detail=f"adapter raised {type(exc).__name__}: {exc}")
@@ -197,7 +240,23 @@ class Worker:
             with contextlib.suppress(GuardFailed, LeaseLost):
                 self.repo.time_out_run(run_id)
             return
+        if not isinstance(response, AgentResponse):  # anything that is not a valid AgentResponse is malformed: fail closed
+            try:
+                response = AgentResponse.model_validate(response)
+            except ValidationError:
+                self._reject(task, run_id, "malformed", "adapter output does not validate against agent-response/1", None, adapter)
+                return
+        if len(response.model_dump_json()) > MAX_RESPONSE_BYTES:
+            self._reject(task, run_id, "oversized", "serialized adapter response is too large", None, adapter)
+            return
         usage = response.resource_usage
+        if not adapter.is_mock:
+            self._audit("adapter.response_received", task, {"role": task.assigned_role.value, "status": response.status,
+                                                            "artifacts": len(response.produced_artifacts), "notes": response.notes[:500]})
+        if response.status == "needs_input":
+            with contextlib.suppress(LeaseLost):
+                self.repo.park_run(run_id, self.worker_id, response.notes or "needs external input", usage=usage)
+            return
         if response.status != "succeeded":
             self._fail(run_id, retryable=response.retryable, error_class=(response.error.error_class if response.error else "adapter_error"),
                        detail=(response.error.detail if response.error else f"status {response.status}"), usage=usage)
@@ -205,12 +264,16 @@ class Worker:
         forbidden = (self.artifacts.store.root, self.artifacts.store.eval_root)
         verdict = verify_response(request, response, workdir, forbidden)
         if not verdict.passed:
-            if any("hash_mismatch" in p for p in verdict.problems):  # lying about content is a security signal: never retried
-                self._fail(run_id, retryable=False, error_class="hash_mismatch", detail="; ".join(verdict.problems), usage=usage)
-                return
-            # A verifier failure is retried ONCE per task (PROPOSAL): the first schema_violation is retryable, the second is not.
-            prior = sum(e.error_class == "schema_violation" for e in task.error_history)
-            self._fail(run_id, retryable=prior == 0, error_class="schema_violation", detail="; ".join(verdict.problems), usage=usage)
+            joined = "; ".join(verdict.problems)
+            if any("hash_mismatch" in p for p in verdict.problems):
+                category = "hash_mismatch"
+            elif any("oversized" in p for p in verdict.problems):
+                category = "oversized"
+            elif any("does not exist" in p or "missing expected outputs" in p for p in verdict.problems):
+                category = "missing_artifact"
+            else:
+                category = "schema"
+            self._reject(task, run_id, category, joined, usage, adapter)
             return
         try:
             for p in response.produced_artifacts:

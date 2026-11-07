@@ -17,7 +17,7 @@ from airos.canonical import canonical_json, sha256_hex
 from airos.errors import SchemaMismatch
 
 # Pin of the packaged default table. Editing prices-v1.json without bumping this pin (and the version) fails at load.
-DEFAULT_PRICE_TABLE_SHA256 = "90d884bfe4ad68865238c9dd7a6362e24ee1525f5b2c448728b45b3b86758a70"
+DEFAULT_PRICE_TABLE_SHA256 = "096837c0274cb9b56a2eea4bec6d048310e9fcc8b43760c1b10ee5f09b23d344"
 
 
 @dataclass(frozen=True)

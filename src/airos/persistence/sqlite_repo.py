@@ -932,6 +932,27 @@ class SqliteRepository:
                                    reason=f"retry blocked: {res.reason}", error=error, run_end=end)
             ev = Event.TIMEOUT if outcome is RunState.TIMED_OUT else Event.FAIL
             return self._apply(conn, task, ev, SYSTEM, ctx, reason="non-retryable failure", error=error, run_end=end)
+    def park_run(self, run_id: str, worker_id: str, reason: str, *, usage: ResourceUsage | None = None,
+                 actor: Actor = SYSTEM) -> TaskRecord:
+        """The agent needs something external (e.g. a handoff result). The run ends (abandoned), measured usage settles, and the
+        task goes to blocked(needs_input), which only a HUMAN can resume. Never auto-retried."""
+        with self._denial_scope(actor, "run.complete"), self._tx() as conn:
+            self._check_actor(conn, actor)
+            authorize(actor.kind, "run.complete")
+            now = self.clock.now_ms()
+            r = conn.execute("SELECT * FROM runs WHERE run_id=?", (run_id,)).fetchone()
+            if r is None:
+                raise NotFound(f"run {run_id!r}")
+            if r["lease_owner"] != worker_id or r["state"] != "running" or r["lease_expires_at_ms"] <= now:
+                raise LeaseLost(f"run {run_id}: lease not held by {worker_id!r}; discard the result")
+            task = self._load_task(conn, r["task_id"])
+            if task.state is not TaskState.RUNNING:
+                raise LeaseLost(f"task {task.task_id} is no longer running")
+            if now >= self._run_deadline_ms(r, task):
+                return self._time_out_run_row(conn, task, r)
+            return self._apply(conn, task, Event.BLOCK, SYSTEM, GuardContext(block_reason=BlockReason.NEEDS_INPUT),
+                               reason=reason, run_end=RunState.ABANDONED, usage=usage)
+
     # ------------------------------------------------------------ wall-clock timeouts (enforced here, never by the adapter)
 
     @staticmethod
@@ -1133,7 +1154,7 @@ class SqliteRepository:
     def record_system_event(self, event_type: str, payload: dict[str, Any], task_id: str | None = None,
                             actor: Actor = SYSTEM) -> AuditEvent:
         """Audited errors raised outside a state change (e.g. routing failures). Event types are allow-listed."""
-        if event_type not in {"agent.route_failed", "worker.error"}:
+        if event_type not in {"agent.route_failed", "worker.error", "adapter.response_rejected", "adapter.response_received"}:
             raise ValueError(f"event type {event_type!r} is not allowed here")
         with self._denial_scope(actor, "audit.append_system_event", task_id), self._tx() as conn:
             self._check_actor(conn, actor)

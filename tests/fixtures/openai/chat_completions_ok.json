@@ -1,0 +1,22 @@
+{
+  "name": "openai chat completions: success",
+  "provenance": "synthetic: modelled on the documented response shape; NOT a live recording",
+  "request": {
+    "method": "POST",
+    "url": "https://api.openai.com/v1/chat/completions",
+    "headers_present": ["Authorization", "Content-Type"],
+    "body_json_subset": {"model": "gpt-test", "messages": [{"role": "system"}, {"role": "user"}]}
+  },
+  "response": {
+    "status": 200,
+    "headers": {"content-type": "application/json"},
+    "body": {
+      "id": "chatcmpl-synthetic-1",
+      "object": "chat.completion",
+      "model": "gpt-test",
+      "choices": [{"index": 0, "finish_reason": "stop",
+                   "message": {"role": "assistant", "content": "[SYNTHETIC] Brief: investigate topic X in three steps."}}],
+      "usage": {"prompt_tokens": 120, "completion_tokens": 30, "total_tokens": 150}
+    }
+  }
+}

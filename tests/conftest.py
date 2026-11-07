@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import itertools
+import socket
 from collections.abc import Callable, Iterator
 from pathlib import Path
 
@@ -33,7 +34,9 @@ AGENT_ACTORS = (PLANNER, DIRECTOR, EXECUTOR, CGW, SCI)
 # Test price table: "unit-model" costs exactly 1 micro-USD per token (in and out), so tests can pick USD by picking tokens.
 TEST_PRICES = PriceTable.from_dict({
     "schema": "airos-prices/1", "version": "test-v1", "currency": "USD", "unit": "usd_micro_per_million_tokens",
-    "models": {"mock": {"input": 0, "output": 0}, "unit-model": {"input": 1_000_000, "output": 1_000_000}}})
+    "models": {"mock": {"input": 0, "output": 0}, "unit-model": {"input": 1_000_000, "output": 1_000_000},
+               "gpt-test": {"input": 1_000_000, "output": 1_000_000}, "claude-test": {"input": 1_000_000, "output": 1_000_000},
+               "handoff": {"input": 0, "output": 0}}})
 
 _counter = itertools.count(1)
 
@@ -67,6 +70,19 @@ def free_contract(**over: object) -> TaskContract:
     }
     base.update(over)
     return make_contract(**base)
+
+
+@pytest.fixture(autouse=True)
+def _no_network(monkeypatch: pytest.MonkeyPatch) -> None:
+    """CI makes ZERO network calls: any attempt to connect or resolve a name fails the test that tried it."""
+
+    def boom(*_a: object, **_k: object) -> None:
+        raise AssertionError("network access is forbidden in tests")
+
+    for name in ("connect", "connect_ex"):
+        monkeypatch.setattr(socket.socket, name, boom)
+    monkeypatch.setattr(socket, "create_connection", boom)
+    monkeypatch.setattr(socket, "getaddrinfo", boom)
 
 
 @pytest.fixture

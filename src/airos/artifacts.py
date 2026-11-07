@@ -137,6 +137,12 @@ class ArtifactService:
             raise IntegrityError(
                 f"hash_mismatch for {produced.logical_name}: response claims {produced.sha256}, bytes hash to {sha}")
         final = produced.artifact_class is ArtifactClass.FINAL_EVALUATION
+        red = self.repo.redactor
+        if red.contains_secret(data.decode("latin-1")):
+            if not (produced.media_type.startswith("text/") or produced.media_type == "application/json"):
+                raise UnsafePath(f"{produced.logical_name}: binary artifact contains a secret; refusing to store it")
+            data = red.redact_text(data.decode("utf-8", "replace")).encode("utf-8")  # integrity was checked on the ORIGINAL bytes
+            sha = sha256_hex(data)
         self.store.put(data, final_eval=final)
         art = Artifact(
             artifact_id=artifact_id, sha256=sha, size_bytes=len(data), media_type=produced.media_type,

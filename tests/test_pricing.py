@@ -64,7 +64,7 @@ def test_table_is_validated_hashed_and_pinned():
 
 def test_packaged_default_table_is_pinned_and_contains_no_invented_prices(tmp_path):
     d = PriceTable.default()
-    assert d.sha256 == DEFAULT_PRICE_TABLE_SHA256 and set(d.models) == {"mock"}
+    assert d.sha256 == DEFAULT_PRICE_TABLE_SHA256 and set(d.models) == {"mock", "handoff"}
     assert d.cost_usd_micro("mock", 10**6, 10**6) == 0
     # editing the shipped file without bumping the pin fails closed
     from importlib import resources

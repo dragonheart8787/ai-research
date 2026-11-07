@@ -28,7 +28,13 @@ def verify_response(request: AgentRequest, response: AgentResponse, run_dir: Pat
         problems.append(f"missing expected outputs: {sorted(expected - produced)}")
     if produced - expected:
         problems.append(f"unexpected outputs: {sorted(produced - expected)}")
+    max_bytes = {e.logical_name: e.max_bytes for e in request.expected_output}
+    if len(response.produced_artifacts) > 64:
+        problems.append(f"oversized: {len(response.produced_artifacts)} artifacts claimed (limit 64)")
     for p in response.produced_artifacts:
+        if p.size_bytes > max_bytes.get(p.logical_name, 10**12):
+            problems.append(f"{p.logical_name}: oversized ({p.size_bytes} bytes, limit {max_bytes[p.logical_name]})")
+            continue
         try:
             data = safe_resolve_in(run_dir, p.path, forbidden).read_bytes()
         except UnsafePath as exc:

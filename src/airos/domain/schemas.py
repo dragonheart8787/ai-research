@@ -127,7 +127,7 @@ class ArtifactRef(StrictModel):
 
 
 class ExpectedOutput(StrictModel):
-    logical_name: str = Field(pattern=r"^[A-Za-z0-9._-]{1,128}$")
+    logical_name: str = Field(pattern=r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
     media_type: str = Field(min_length=1, max_length=128)
     artifact_class: ArtifactClass
     max_bytes: int = Field(25 * 1024 * 1024, ge=1, le=256 * 1024 * 1024)
@@ -346,7 +346,7 @@ def build_agent_request(
 
 
 class ProducedArtifact(StrictModel):
-    logical_name: str = Field(pattern=r"^[A-Za-z0-9._-]{1,128}$")
+    logical_name: str = Field(pattern=r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
     path: str = Field(min_length=1, max_length=512)
     sha256: str = Field(pattern=SHA256_RE)
     size_bytes: int = Field(ge=0)
@@ -494,7 +494,7 @@ class Artifact(StrictModel):
     size_bytes: int = Field(ge=0)
     media_type: str
     artifact_class: ArtifactClass
-    logical_name: str = Field(pattern=r"^[A-Za-z0-9._-]{1,128}$")
+    logical_name: str = Field(pattern=r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
     storage_uri: str
     producer_run_id: str | None = None
     producer_principal_id: str | None = None

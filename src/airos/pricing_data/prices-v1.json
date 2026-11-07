@@ -1,9 +1,16 @@
 {
   "schema": "airos-prices/1",
-  "version": "2026-11-v1",
+  "version": "2026-11-v2",
   "currency": "USD",
   "unit": "usd_micro_per_million_tokens",
   "models": {
-    "mock": {"input": 0, "output": 0}
+    "mock": {
+      "input": 0,
+      "output": 0
+    },
+    "handoff": {
+      "input": 0,
+      "output": 0
+    }
   }
 }

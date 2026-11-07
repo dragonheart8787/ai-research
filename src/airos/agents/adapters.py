@@ -18,6 +18,8 @@ from airos.domain.schemas import (
     Role,
 )
 
+InputReader = Callable[[str], bytes]  # artifact_id -> bytes, bound by the worker to the agent's own read permissions
+
 Behavior = Literal["success", "transient_failure", "permanent_failure", "crash", "invalid_output"]
 
 _CLASS_FOR_ROLE: dict[Role, ArtifactClass] = {
@@ -33,7 +35,7 @@ class AgentAdapter(Protocol):
     role: Role
     is_mock: bool
 
-    def execute(self, request: AgentRequest, workdir: Path) -> AgentResponse:
+    def execute(self, request: AgentRequest, workdir: Path, inputs: InputReader | None = None) -> AgentResponse:
         """Do the work inside `workdir` (outputs under workdir/out) and return a machine-readable response."""
         ...
 
@@ -50,7 +52,7 @@ class MockAdapter:
     script: Callable[[AgentRequest], Behavior] = _always_success
     is_mock: bool = True
 
-    def execute(self, request: AgentRequest, workdir: Path) -> AgentResponse:
+    def execute(self, request: AgentRequest, workdir: Path, inputs: InputReader | None = None) -> AgentResponse:
         behavior = self.script(request)
         if behavior == "crash":
             raise RuntimeError("mock adapter crashed")
