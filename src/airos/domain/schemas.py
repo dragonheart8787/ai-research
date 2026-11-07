@@ -68,7 +68,7 @@ class TrustLevel(str, Enum):
 
 ErrorClass = Literal[
     "transient", "adapter_error", "schema_violation", "timeout", "budget", "policy",
-    "handoff_invalid", "crash_recovery", "hash_mismatch", "cancelled",
+    "handoff_invalid", "crash_recovery", "hash_mismatch", "cancelled", "credit_exhausted",
 ]
 
 
@@ -276,6 +276,8 @@ class TaskRecord(StrictModel):
     review_cycles: int
     timeout_retries: int
     over_root_limit: bool = False
+    uncounted_attempts: int = 0   # attempts that ended in credit exhaustion do not count toward the retry limit
+    review_hold: bool = False     # billing-integrity hold: only a human may review/accept
     not_before_ms: int | None
     error_history: list[ErrorRecord]
     created_by: str
@@ -401,6 +403,9 @@ class AgentResponse(StrictModel):
     evidence: list[EvidenceCheck] = Field(default_factory=list)
     notes: str = Field("", max_length=20_000)
     error: ErrorRecord | None = None
+    # How the provider says it authenticated this run ("subscription_oauth", "manual_handoff", or something else). The control plane
+    # compares it with the adapter's expected auth mode after every run (billing-integrity check, ADR-0011). None = unconfirmed.
+    auth_path: str | None = None
 
     @model_validator(mode="after")
     def _evidence_refs_resolve(self) -> AgentResponse:
@@ -462,6 +467,7 @@ class LedgerKind(str, Enum):
     SETTLE = "settle"
     RELEASE = "release"
     ADJUST = "adjust"
+    RECONCILIATION = "reconciliation"  # human-only: aligns the estimate with the account page
 
 
 class BudgetLedgerEntry(StrictModel):
@@ -477,6 +483,8 @@ class BudgetLedgerEntry(StrictModel):
     approval_id: str | None = None
     attempt: int | None = None
     reserve_ref: str | None = None
+    recorded_by: str | None = None
+    flagged: bool = False
     idempotency_key: str = Field(min_length=1, max_length=200)
     created_at_ms: int
 
@@ -503,6 +511,9 @@ class Artifact(StrictModel):
     parent_artifact_ids: list[str] = Field(default_factory=list)
     created_at_ms: int
     provenance_hash: str | None = Field(None, pattern=SHA256_RE)
+    orphaned: bool = False             # its run ended timed_out/failed/cancelled/abandoned: never usable as input
+    orphaned_reason: str | None = None
+    removed_at_ms: int | None = None   # removal is a human-only action
 
     @model_validator(mode="after")
     def _one_producer(self) -> Artifact:

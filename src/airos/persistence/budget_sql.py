@@ -33,10 +33,27 @@ def global_budget_id(now_ms: int) -> str:
     return "global:" + datetime.fromtimestamp(now_ms / 1000, tz=UTC).strftime("%Y-%m-%d")
 
 
+POOL_ROLES = frozenset({"planner", "executor", "ai_scientist"})   # roles that draw on the agent_sdk_credit pool
+USAGE_KINDS = "('reserve','release','settle','adjust','reconciliation')"
+
+
+def month_key(now_ms: int) -> str:
+    return datetime.fromtimestamp(now_ms / 1000, tz=UTC).strftime("%Y-%m")
+
+
+def pool_budget_id(now_ms: int) -> str:
+    return f"pool:agent_sdk_credit:{month_key(now_ms)}"
+
+
+def alloc_budget_id(role: str, now_ms: int) -> str:
+    return f"alloc:{role}:{month_key(now_ms)}"
+
+
 @dataclass(frozen=True)
 class ReserveOutcome:
     ok: bool
     reason: str | None = None
+    credit: bool = False   # the refusal came from the credit pool / a role allocation (=> blocked(credit_exhausted))
     already_held: bool = False
     reserved_usd_micro: int = 0
     reserved_tokens: int = 0
@@ -57,7 +74,7 @@ def task_limits(task: TaskRecord, grant_usd: int, grant_tokens: int) -> tuple[in
 def usage(conn: sqlite3.Connection, budget_id: str) -> tuple[int, int]:
     r = conn.execute(
         "SELECT COALESCE(SUM(usd_micro),0), COALESCE(SUM(tokens),0) FROM budget_ledger "
-        "WHERE budget_id=? AND kind IN ('reserve','release','settle','adjust')", (budget_id,)).fetchone()
+        f"WHERE budget_id=? AND kind IN {USAGE_KINDS}", (budget_id,)).fetchone()
     return int(r[0]), int(r[1])
 
 
@@ -69,10 +86,10 @@ def grants(conn: sqlite3.Connection, budget_id: str) -> tuple[int, int]:
 
 
 def ensure_budget(conn: sqlite3.Connection, budget_id: str, scope: str, ref: str, usd: int, tokens: int,
-                  created_by: str, now_ms: int) -> sqlite3.Row:
+                  created_by: str, now_ms: int, state: str = "active") -> sqlite3.Row:
     conn.execute(
         "INSERT OR IGNORE INTO budgets(budget_id,scope,scope_ref,limit_usd_micro,limit_tokens,state,created_by,created_at_ms)"
-        " VALUES(?,?,?,?,?,'active',?,?)", (budget_id, scope, ref, usd, tokens, created_by, now_ms))
+        " VALUES(?,?,?,?,?,?,?,?)", (budget_id, scope, ref, usd, tokens, state, created_by, now_ms))
     row: sqlite3.Row = conn.execute("SELECT * FROM budgets WHERE budget_id=?", (budget_id,)).fetchone()
     return row
 
@@ -125,16 +142,40 @@ def reserve(conn: sqlite3.Connection, task: TaskRecord, limits: Limits, now_ms: 
         ensure_budget(conn, global_budget_id(now_ms), "global_daily", global_budget_id(now_ms)[7:],
                       limits.default_global_daily_usd_micro, limits.default_global_daily_tokens, "system", now_ms),
     ]
-    if real_role:  # real adapters default to $0 until a human grants budget
-        rows.append(ensure_budget(conn, role_budget_id(task.assigned_role.value), "role", task.assigned_role.value,
-                                  limits.real_adapter_default_usd_micro, limits.real_adapter_default_tokens, "system", now_ms))
-    for row in rows:
+    credit_rows: list[sqlite3.Row] = []
+    role = task.assigned_role.value
+    if real_role and role in POOL_ROLES:  # Claude-driven roles draw on the monthly agent_sdk_credit pool AND their own allocation
+        frozen = conn.execute(
+            "SELECT 1 FROM budget_ledger r WHERE r.kind='reconciliation' AND r.flagged=1 AND NOT EXISTS ("
+            "SELECT 1 FROM budget_ledger g WHERE g.kind='grant' AND (g.budget_id LIKE 'pool:%' OR g.budget_id LIKE 'alloc:%') "
+            "AND g.created_at_ms >= r.created_at_ms) LIMIT 1").fetchone() is not None
+        st = "frozen" if frozen else "active"   # an under-estimate flagged by a human needs the NEXT grant to be human-approved
+        month = month_key(now_ms)
+        credit_rows = [
+            ensure_budget(conn, pool_budget_id(now_ms), "pool", f"agent_sdk_credit:{month}", limits.agent_sdk_credit_monthly_cap_usd_micro,
+                          limits.pool_token_limit, "system", now_ms, st),
+            ensure_budget(conn, alloc_budget_id(role, now_ms), "alloc", f"{role}:{month}",
+                          limits.role_allocations_usd_micro.get(role, 0), limits.pool_token_limit, "system", now_ms, st),
+        ]
+    elif real_role and role == "director":  # no dollar pool: a human-set cap on runs per UTC day (default 0 = cannot run)
+        day0 = (now_ms // 86_400_000) * 86_400_000
+        started = conn.execute("SELECT COUNT(*) FROM runs r JOIN tasks t ON t.task_id=r.task_id WHERE t.assigned_role='director' "
+                               "AND r.started_at_ms >= ? AND r.started_at_ms < ?", (day0, day0 + 86_400_000)).fetchone()[0]
+        queued = conn.execute(
+            "SELECT COUNT(DISTINCT l.task_id) FROM budget_ledger l JOIN tasks t ON t.task_id=l.task_id WHERE t.assigned_role='director' "
+            "AND l.kind='reserve' AND l.budget_id='task:'||l.task_id AND l.task_id<>? AND NOT EXISTS ("
+            "SELECT 1 FROM budget_ledger x WHERE x.kind='release' AND x.reserve_ref=l.entry_id)", (task.task_id,)).fetchone()[0]
+        if started + queued >= limits.director_max_runs_per_day:
+            return ReserveOutcome(False, f"director run cap reached ({limits.director_max_runs_per_day} runs per UTC day; the human sets it)")
+    for row in [*rows, *credit_rows]:
+        is_credit = row in credit_rows
         if row["state"] != "active":
-            return ReserveOutcome(False, f"budget {row['budget_id']} is {row['state']}")
+            return ReserveOutcome(False, f"budget {row['budget_id']} is {row['state']}", credit=is_credit)
         eff_u, eff_t = effective_limits(conn, row)
         u, t = usage(conn, row["budget_id"])
         if eff_u - u < r_u or eff_t - t < r_t:
-            return ReserveOutcome(False, f"insufficient budget at {row['budget_id']}")
+            return ReserveOutcome(False, f"insufficient budget at {row['budget_id']}", credit=is_credit)
+    rows = [*rows, *credit_rows]
     gen = conn.execute("SELECT COUNT(*) FROM budget_ledger WHERE task_id=? AND attempt=? AND kind='reserve' AND budget_id=?",
                        (task.task_id, attempt, tb)).fetchone()[0] + 1
     levels = [tb, *(r["budget_id"] for r in rows)]
@@ -168,6 +209,11 @@ def close(conn: sqlite3.Connection, task: TaskRecord, attempt: int, now_ms: int,
             if u > eff_u or t > eff_t:
                 conn.execute("UPDATE budgets SET state='exhausted' WHERE budget_id=?", (brow["budget_id"],))
     return len(rows)
+
+
+def unfreeze_credit_budgets(conn: sqlite3.Connection) -> None:
+    """A human-approved grant on the pool/an allocation clears a reconciliation freeze (the 'next grant' rule)."""
+    conn.execute("UPDATE budgets SET state='active' WHERE state='frozen' AND scope IN ('pool','alloc')")
 
 
 def reactivate_if_within_limit(conn: sqlite3.Connection, budget_id: str) -> None:

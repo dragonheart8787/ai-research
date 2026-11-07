@@ -86,6 +86,7 @@ class BlockReason(str, Enum):
     ADAPTER_UNAVAILABLE = "adapter_unavailable"
     CRASH_RECOVERY_DECISION = "crash_recovery_decision"
     BUDGET_EXHAUSTED = "budget_exhausted"
+    CREDIT_EXHAUSTED = "credit_exhausted"  # the subscription credit is used up / the provider stopped requests; human-only resume
 
 
 class SideEffectClass(str, Enum):

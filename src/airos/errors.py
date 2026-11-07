@@ -43,8 +43,9 @@ class ActorNotAllowed(NotAuthorized):
 class BudgetInsufficient(GuardFailed):
     """A reservation could not be made (task, root, global-daily or role level)."""
 
-    def __init__(self, reason: str) -> None:
+    def __init__(self, reason: str, credit: bool = False) -> None:
         super().__init__("budget_reservation", reason)
+        self.credit = credit
 
 
 class AdapterUnavailable(AirosError):

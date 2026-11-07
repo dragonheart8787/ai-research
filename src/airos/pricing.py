@@ -2,13 +2,15 @@
 
 Units: integer micro-USD per million tokens. cost = ceil((tokens_in * in_price + tokens_out * out_price) / 1_000_000),
 pure integer arithmetic (no floats). A model with no entry has NO price: callers must settle at worst case and flag it.
-The shipped table contains only `mock` (price 0). Real model prices are business inputs a human must supply in a table
-file; this repository does not guess them.
+The shipped table contains only `mock` and `handoff` (price 0, internal). Real model prices are business inputs a human must supply in a table
+file WITH a source_url and retrieved_at; this repository does not guess them. Under a subscription the numbers are an ESTIMATE of consumption
+(tokens x API rates), not a bill.
 """
 from __future__ import annotations
 
 import json
 from dataclasses import dataclass
+from datetime import date
 from importlib import resources
 from pathlib import Path
 from typing import Any
@@ -17,13 +19,16 @@ from airos.canonical import canonical_json, sha256_hex
 from airos.errors import SchemaMismatch
 
 # Pin of the packaged default table. Editing prices-v1.json without bumping this pin (and the version) fails at load.
-DEFAULT_PRICE_TABLE_SHA256 = "096837c0274cb9b56a2eea4bec6d048310e9fcc8b43760c1b10ee5f09b23d344"
+DEFAULT_PRICE_TABLE_SHA256 = "53cf32bc6d67099d70ef916beeb721dce5bcffb4ec547d28f33468843e659aeb"
 
 
 @dataclass(frozen=True)
 class ModelPrice:
+    model_id: str
     input_usd_micro_per_mtok: int
     output_usd_micro_per_mtok: int
+    source_url: str       # where the price was read (required; "internal:..." only for zero-cost internal entries)
+    retrieved_at: str     # ISO date the price was read (required)
 
 
 @dataclass(frozen=True)
@@ -45,7 +50,7 @@ class PriceTable:
 
     @classmethod
     def from_dict(cls, data: dict[str, Any], expected_sha256: str | None = None) -> PriceTable:
-        if data.get("schema") != "airos-prices/1" or data.get("unit") != "usd_micro_per_million_tokens" \
+        if data.get("schema") != "airos-prices/2" or data.get("unit") != "usd_micro_per_million_tokens" \
                 or data.get("currency") != "USD" or not isinstance(data.get("version"), str) or not data["version"]:
             raise SchemaMismatch("price table: bad schema/unit/currency/version")
         try:
@@ -56,10 +61,21 @@ class PriceTable:
             raise SchemaMismatch(f"price table sha256 {digest} does not match the pinned {expected_sha256}")
         models: dict[str, ModelPrice] = {}
         for name, p in data.get("models", {}).items():
-            vals = (p.get("input"), p.get("output"))
-            if not all(isinstance(v, int) and not isinstance(v, bool) and v >= 0 for v in vals) or set(p) != {"input", "output"}:
+            # fail closed on ANY missing field: an entry without provenance (source_url, retrieved_at) is not a price
+            if not isinstance(p, dict) or set(p) != {"model_id", "input", "output", "source_url", "retrieved_at"}:
+                raise SchemaMismatch(f"price table: entry {name!r} must have exactly model_id, input, output, source_url, retrieved_at")
+            if p["model_id"] != name:
+                raise SchemaMismatch(f"price table: model_id {p['model_id']!r} does not match key {name!r}")
+            vals = (p["input"], p["output"])
+            if not all(isinstance(v, int) and not isinstance(v, bool) and v >= 0 for v in vals):
                 raise SchemaMismatch(f"price table: bad price for model {name!r} (non-negative integers only)")
-            models[name] = ModelPrice(int(vals[0]), int(vals[1]))
+            if not isinstance(p["source_url"], str) or not p["source_url"].strip():
+                raise SchemaMismatch(f"price table: entry {name!r} has no source_url")
+            try:
+                date.fromisoformat(str(p["retrieved_at"]))
+            except ValueError as exc:
+                raise SchemaMismatch(f"price table: entry {name!r} has no valid retrieved_at date") from exc
+            models[name] = ModelPrice(name, int(vals[0]), int(vals[1]), p["source_url"], p["retrieved_at"])
         return cls(data["version"], digest, models)
 
     @classmethod

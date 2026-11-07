@@ -1,7 +1,7 @@
 """Operational limits (PROPOSAL 4.4). Defaults; hard caps are enforced in schemas."""
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 
 @dataclass(frozen=True)
@@ -26,8 +26,13 @@ class Limits:
     default_root_tokens: int = 20_000_000
     default_global_daily_usd_micro: int = 25_000_000
     default_global_daily_tokens: int = 50_000_000
-    real_adapter_default_usd_micro: int = 0
-    real_adapter_default_tokens: int = 0
+    # ONE ledger pool "agent_sdk_credit" per month (ADR-0011). Defaults: cap 15 USD (assumed Pro credit 20 USD, to be verified by the human),
+    # Executor 10, Planner 3, AI Scientist 0, 2 unallocated. Raising any allocation needs a human approval bound to the contract hash.
+    agent_sdk_credit_monthly_cap_usd_micro: int = 15_000_000
+    role_allocations_usd_micro: dict[str, int] = field(default_factory=lambda: {"executor": 10_000_000, "planner": 3_000_000, "ai_scientist": 0})
+    pool_token_limit: int = 10**12      # the credit is dollar-denominated; tokens are not the constraint
+    director_max_runs_per_day: int = 0  # the Director has no dollar pool; the human sets a run cap (0 = cannot run)
+    drift_flag_ratio_ppm: int = 150_000  # reconciliation drift above 15 % of the monthly cap is flagged
 
     def backoff_ms(self, attempt: int) -> int:
         """Deterministic exponential backoff (no jitter in M1; jitter is a scheduler concern)."""

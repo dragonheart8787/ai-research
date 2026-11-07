@@ -51,6 +51,9 @@ EXPECTED_OPS: dict[str, set[ActorKind]] = {
     "artifact.release": {K.HUMAN},
     "audit.append_system_event": {K.SYSTEM},
     "cascade.cancel": {K.SYSTEM},
+    "artifact.remove_orphan": {K.HUMAN},
+    "task.hold_review": {K.SYSTEM},
+    "budget.reconcile": {K.HUMAN},
 }
 EVENT_ACTIONS = {f"event:{e.value}" for e in Event}
 
@@ -166,6 +169,9 @@ def _ops(repo):
         "artifact.release": lambda a: repo.release_artifact("no-such-artifact", a),
         "audit.append_system_event": lambda a: repo.record_system_event("worker.error", {"x": 1}, actor=a),
         "cascade.cancel": lambda a: repo.cascade_cancel_descendants(cancelled.task_id, actor=a),
+        "artifact.remove_orphan": lambda a: repo.remove_orphaned_artifact("no-such-artifact", a),
+        "task.hold_review": lambda a: repo.hold_for_human_review(approved.task_id, "billing.integrity_mismatch", {"x": 1}, actor=a),
+        "budget.reconcile": lambda a: repo.record_reconciliation("pool:agent_sdk_credit:2023-11", 1, a),
     }
 
 

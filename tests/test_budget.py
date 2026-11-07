@@ -229,16 +229,26 @@ def test_per_task_limit_exhaustion_blocks_the_retry(repo):
     assert "per-task budget exhausted" in [e for e in repo.iter_events() if e.event_type == "budget.reservation_refused"][-1].payload["reason"]
 
 
-def test_real_adapter_budget_defaults_to_zero_until_a_human_grants_it(open_repo):
-    repo = open_repo(real_roles=["executor"])
+def test_a_real_adapter_with_a_zero_allocation_is_blocked_as_credit_exhausted(open_repo):
+    from airos.domain.limits import Limits
+
+    repo = open_repo(real_roles=["executor"], limits=Limits(role_allocations_usd_micro={"executor": 0}))
     t = _approved(repo)
     out = repo.queue_task(t.task_id, t.version)
-    assert out.state is TaskState.BLOCKED
-    assert repo.budget_status("role:executor").limit_usd_micro == 0
-    # mock roles are unaffected by the role level
+    assert out.state is TaskState.BLOCKED and out.blocked_reason is BlockReason.CREDIT_EXHAUSTED
+    assert repo.budget_status(budget_sql.alloc_budget_id("executor", repo.clock.now_ms())).limit_usd_micro == 0
+    # mock roles are unaffected by the pool and allocation levels
     other = approve_fully(repo, repo.create_task(free_contract(assigned_role=Role.CHATGPT_WORK, approval_requirements=[
         {"type": "external_handoff", "reason": "x"}]), HUMAN).task)
     assert repo.queue_task(other.task_id, other.version).state is TaskState.QUEUED
+
+
+def test_the_director_has_no_dollar_pool_but_a_human_set_daily_run_cap_defaulting_to_zero(open_repo):
+    repo = open_repo(real_roles=["director"])
+    t = approve_fully(repo, repo.create_task(free_contract(assigned_role=Role.DIRECTOR, approval_requirements=[
+        {"type": "execute", "reason": "x"}]), HUMAN).task)
+    out = repo.queue_task(t.task_id, t.version)
+    assert out.state is TaskState.BLOCKED and out.blocked_reason is BlockReason.BUDGET_INSUFFICIENT
 
 
 # ------------------------------------------------------------------ increases: human approval bound to the contract hash
@@ -251,10 +261,13 @@ def _grant_flow(repo, task, budget_id, usd, tokens):
 
 
 def test_increase_unblocks_real_adapter_end_to_end(open_repo):
-    repo = open_repo(real_roles=["executor"])
+    from airos.domain.limits import Limits
+
+    repo = open_repo(real_roles=["executor"], limits=Limits(role_allocations_usd_micro={"executor": 0}))
     t = _approved(repo)
     blocked = repo.queue_task(t.task_id, t.version)
-    ap = repo.request_budget_increase(t.task_id, "role:executor", USD, 200_000, PLANNER)
+    bid = budget_sql.alloc_budget_id("executor", repo.clock.now_ms())
+    ap = repo.request_budget_increase(t.task_id, bid, USD, 200_000, PLANNER)
     assert (ap.approval_type, ap.task_version, ap.contract_sha256) == (ApprovalType.BUDGET_INCREASE, 1, t.contract_sha256)
     with pytest.raises(NotAuthorized):  # pending -> cannot be applied
         repo.grant_budget(ap.approval_id)
@@ -262,8 +275,8 @@ def test_increase_unblocks_real_adapter_end_to_end(open_repo):
     entry = repo.grant_budget(ap.approval_id)
     assert entry.kind.value == "grant" and entry.usd_micro == USD and entry.approval_id == ap.approval_id
     assert repo.grant_budget(ap.approval_id).entry_id == entry.entry_id                      # single use
-    assert len([e for e in repo.list_ledger("role:executor") if e.kind.value == "grant"]) == 1
-    assert repo.budget_status("role:executor").limit_usd_micro == USD
+    assert len([e for e in repo.list_ledger(bid) if e.kind.value == "grant"]) == 1
+    assert repo.budget_status(bid).limit_usd_micro == USD
     resumed = repo.enqueue(blocked.task_id, Event.UNBLOCK, HUMAN, blocked.version)
     assert resumed.state is TaskState.QUEUED
 

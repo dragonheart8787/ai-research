@@ -89,6 +89,15 @@ SYSTEM = Actor(ActorKind.SYSTEM, "system")
 
 
 @dataclass(frozen=True)
+class ReconciliationResult:
+    entry_id: str
+    delta_usd_micro: int       # estimated remaining - reported remaining (positive: we under-counted spending)
+    drift_ppm: int
+    flagged: bool
+    frozen: bool
+
+
+@dataclass(frozen=True)
 class BudgetStatus:
     budget_id: str
     limit_usd_micro: int
@@ -358,7 +367,7 @@ class SqliteRepository:
             blocked_from=TaskState(r["blocked_from"]) if r["blocked_from"] else None,
             contract=TaskContract.model_validate_json(r["contract_json"]), contract_sha256=r["contract_sha256"],
             side_effect_class=SideEffectClass(r["side_effect_class"]), attempt_count=r["attempt_count"],
-            review_cycles=r["review_cycles"], timeout_retries=r["timeout_retries"], over_root_limit=bool(r["over_root_limit"]),
+            review_cycles=r["review_cycles"], timeout_retries=r["timeout_retries"], over_root_limit=bool(r["over_root_limit"]), uncounted_attempts=r["uncounted_attempts"], review_hold=bool(r["review_hold"]),
             not_before_ms=r["not_before_ms"],
             error_history=[ErrorRecord.model_validate(e) for e in json.loads(r["error_history_json"])],
             created_by=r["created_by"], created_at_ms=r["created_at_ms"], updated_at_ms=r["updated_at_ms"],
@@ -399,10 +408,12 @@ class SqliteRepository:
 
     def _check_inputs(self, conn: sqlite3.Connection, contract: TaskContract) -> None:
         for ref in contract.input_artifact_refs:
-            row = conn.execute("SELECT sha256, artifact_class, trust_level FROM artifacts WHERE artifact_id=?",
+            row = conn.execute("SELECT sha256, artifact_class, trust_level, orphaned, removed_at_ms FROM artifacts WHERE artifact_id=?",
                                (ref.artifact_id,)).fetchone()
             if row is None or row["sha256"] != ref.sha256:
                 raise GuardFailed("inputs", f"input artifact {ref.artifact_id!r} is not registered with that sha256")
+            if row["orphaned"] or row["removed_at_ms"] is not None:
+                raise GuardFailed("inputs", f"artifact {ref.artifact_id!r} is orphaned/removed and can never be a task input")
             if row["artifact_class"] == ArtifactClass.FINAL_EVALUATION.value:
                 raise GuardFailed("inputs", "final-evaluation artifacts can never be task inputs")
             if row["trust_level"] == TrustLevel.QUARANTINED.value:
@@ -607,6 +618,8 @@ class SqliteRepository:
                     "UPDATE runs SET state=?, ended_at_ms=?, error_class=?, error_detail=? WHERE run_id=?",
                     (end.value, now, clean_err.error_class if clean_err else None, clean_err.detail if clean_err else None, run_id),
                 )
+                if end in (RunState.TIMED_OUT, RunState.FAILED, RunState.CANCELLED, RunState.ABANDONED):
+                    self._orphan_run_artifacts(conn, run_id, end.value)
         if task.kind is TaskKind.WORK:
             if task.state is TaskState.RUNNING:  # settle: measured usage, or WORST CASE when unmeasured
                 self._close_reservation(conn, task, task.attempt_count, run_id=run_id, settle=True, usage=usage)
@@ -647,6 +660,16 @@ class SqliteRepository:
             if task.state not in (TaskState.FAILED, TaskState.TIMED_OUT, TaskState.CANCELLED):
                 raise GuardFailed("cascade", f"task is {task.state.value}; only an ended task cascades")
             return self._cascade(conn, task_id, (task_id, task.state.value))
+
+    def _orphan_run_artifacts(self, conn: sqlite3.Connection, run_id: str, why: str) -> None:
+        """Artifacts of a run that ended timed_out/failed/cancelled/abandoned are ORPHANED: audited, never usable as input,
+        removable only by a human."""
+        ids = [r[0] for r in conn.execute("SELECT artifact_id FROM artifacts WHERE producer_run_id=? AND orphaned=0 ORDER BY artifact_id", (run_id,))]
+        if not ids:
+            return
+        conn.execute("UPDATE artifacts SET orphaned=1, orphaned_at_ms=?, orphaned_reason=? WHERE producer_run_id=? AND orphaned=0",
+                     (self.clock.now_ms(), f"run ended {why}", run_id))
+        self._append_event(conn, "artifact.orphaned", SYSTEM, run_id=run_id, payload={"artifact_ids": ids, "reason": f"run ended {why}"})
 
     # ------------------------------------------------------------ budget (ledger-backed; same transaction as the transition)
 
@@ -928,12 +951,12 @@ class SqliteRepository:
                         conn.execute("UPDATE tasks SET timeout_retries=timeout_retries+1 WHERE task_id=?", (task.task_id,))
                         out = self._load_task(conn, task.task_id)
                     return out
-                return self._apply(conn, task, Event.BLOCK, SYSTEM, GuardContext(block_reason=BlockReason.BUDGET_INSUFFICIENT),
+                return self._apply(conn, task, Event.BLOCK, SYSTEM, GuardContext(block_reason=BlockReason.CREDIT_EXHAUSTED if res.credit else BlockReason.BUDGET_INSUFFICIENT),
                                    reason=f"retry blocked: {res.reason}", error=error, run_end=end)
             ev = Event.TIMEOUT if outcome is RunState.TIMED_OUT else Event.FAIL
             return self._apply(conn, task, ev, SYSTEM, ctx, reason="non-retryable failure", error=error, run_end=end)
     def park_run(self, run_id: str, worker_id: str, reason: str, *, usage: ResourceUsage | None = None,
-                 actor: Actor = SYSTEM) -> TaskRecord:
+                 actor: Actor = SYSTEM, block_reason: BlockReason = BlockReason.NEEDS_INPUT, uncount_attempt: bool = False) -> TaskRecord:
         """The agent needs something external (e.g. a handoff result). The run ends (abandoned), measured usage settles, and the
         task goes to blocked(needs_input), which only a HUMAN can resume. Never auto-retried."""
         with self._denial_scope(actor, "run.complete"), self._tx() as conn:
@@ -950,8 +973,12 @@ class SqliteRepository:
                 raise LeaseLost(f"task {task.task_id} is no longer running")
             if now >= self._run_deadline_ms(r, task):
                 return self._time_out_run_row(conn, task, r)
-            return self._apply(conn, task, Event.BLOCK, SYSTEM, GuardContext(block_reason=BlockReason.NEEDS_INPUT),
-                               reason=reason, run_end=RunState.ABANDONED, usage=usage)
+            out = self._apply(conn, task, Event.BLOCK, SYSTEM, GuardContext(block_reason=block_reason),
+                              reason=reason, run_end=RunState.ABANDONED, usage=usage)
+            if uncount_attempt:  # e.g. credit exhausted: this attempt never really ran, so it must not eat a retry
+                conn.execute("UPDATE tasks SET uncounted_attempts=uncounted_attempts+1 WHERE task_id=?", (task.task_id,))
+                out = self._load_task(conn, task.task_id)
+            return out
 
     # ------------------------------------------------------------ wall-clock timeouts (enforced here, never by the adapter)
 
@@ -972,7 +999,7 @@ class SqliteRepository:
                 run_guard("retry_allowed", self._guard_input(conn, task, SYSTEM, ctx)) is None:
             res = self._reserve(conn, task)
             if not res.ok:
-                return self._apply(conn, task, Event.BLOCK, SYSTEM, GuardContext(block_reason=BlockReason.BUDGET_INSUFFICIENT),
+                return self._apply(conn, task, Event.BLOCK, SYSTEM, GuardContext(block_reason=BlockReason.CREDIT_EXHAUSTED if res.credit else BlockReason.BUDGET_INSUFFICIENT),
                                    reason=f"timeout retry blocked: {res.reason}", error=err, run_end=RunState.TIMED_OUT)
             self._apply(conn, task, Event.RETRY, SYSTEM, ctx, reason="wall-clock timeout; timeout retry", error=err,
                         run_end=RunState.TIMED_OUT)
@@ -1040,6 +1067,7 @@ class SqliteRepository:
                                   detail=f"lease of worker {r['lease_owner']} expired or owner is dead")
                 if task.state is not TaskState.RUNNING:
                     conn.execute("UPDATE runs SET state='abandoned', ended_at_ms=? WHERE run_id=?", (now, run_id))
+                    self._orphan_run_artifacts(conn, run_id, "abandoned")
                     continue
                 self._close_reservation(conn, task, task.attempt_count, run_id=run_id, settle=True, usage=None)  # worst case
                 if side:
@@ -1056,7 +1084,7 @@ class SqliteRepository:
                             act = RecoveryAction(run_id, task.task_id, "requeued", "retry allowed")
                         else:
                             self._apply(conn, task, Event.BLOCK, SYSTEM,
-                                        GuardContext(block_reason=BlockReason.BUDGET_INSUFFICIENT),
+                                        GuardContext(block_reason=BlockReason.CREDIT_EXHAUSTED if res.credit else BlockReason.BUDGET_INSUFFICIENT),
                                         reason=f"requeue blocked: {res.reason}", error=err, run_end=RunState.ABANDONED)
                             act = RecoveryAction(run_id, task.task_id, "blocked", f"budget: {res.reason}")
                     else:
@@ -1097,6 +1125,11 @@ class SqliteRepository:
                 extra = set(artifact.parent_artifact_ids) - allowed
                 if extra:
                     raise GuardFailed("provenance", f"parents {sorted(extra)} are neither pinned inputs nor outputs of this run")
+            orphan_why: str | None = None
+            if artifact.producer_run_id is not None:
+                st = conn.execute("SELECT state FROM runs WHERE run_id=?", (artifact.producer_run_id,)).fetchone()["state"]
+                if st in ("timed_out", "failed", "cancelled", "abandoned"):
+                    orphan_why = f"registered after its run ended {st}"   # the timing race: result arrives after the deadline
             # Untrusted by construction: whatever the caller claims, these classes are never stored as trusted.
             if cls is ArtifactClass.EXTERNAL_HANDOFF and trust not in (TrustLevel.UNTRUSTED, TrustLevel.QUARANTINED):
                 trust = TrustLevel.UNTRUSTED
@@ -1105,11 +1138,16 @@ class SqliteRepository:
             stored = artifact.model_copy(update={"provenance_hash": provenance_hash(artifact), "trust_level": trust})
             conn.execute(
                 "INSERT INTO artifacts(artifact_id,sha256,size_bytes,media_type,artifact_class,logical_name,storage_uri,"
-                "producer_run_id,producer_principal_id,trust_level,is_mock,provenance_hash,created_at_ms) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                "producer_run_id,producer_principal_id,trust_level,is_mock,provenance_hash,created_at_ms,orphaned,orphaned_at_ms,orphaned_reason)"
+                " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (stored.artifact_id, stored.sha256, stored.size_bytes, stored.media_type, stored.artifact_class.value,
                  stored.logical_name, stored.storage_uri, stored.producer_run_id, stored.producer_principal_id,
-                 stored.trust_level.value, int(stored.is_mock), stored.provenance_hash, stored.created_at_ms),
+                 stored.trust_level.value, int(stored.is_mock), stored.provenance_hash, stored.created_at_ms,
+                 int(orphan_why is not None), self.clock.now_ms() if orphan_why else None, orphan_why),
             )
+            if orphan_why:
+                self._append_event(conn, "artifact.orphaned", SYSTEM, run_id=stored.producer_run_id,
+                                   payload={"artifact_ids": [stored.artifact_id], "reason": orphan_why})
             for pid in stored.parent_artifact_ids:
                 conn.execute("INSERT INTO artifact_lineage(child_artifact_id,parent_artifact_id,relation) VALUES(?,?,'derived_from')",
                              (stored.artifact_id, pid))
@@ -1126,6 +1164,10 @@ class SqliteRepository:
         with self._denial_scope(actor, action, for_task_id):
             conn = self._read()
             self._check_actor(conn, actor)
+            if art.removed_at_ms is not None:
+                raise NotFound(f"artifact {artifact_id!r} was removed")
+            if art.orphaned and actor.kind not in (ActorKind.HUMAN, ActorKind.SYSTEM):
+                raise NotAuthorized(f"artifact {artifact_id} is orphaned; only a human may inspect it")
             pinned = False
             if for_task_id is not None:
                 task = self._load_task(conn, for_task_id)
@@ -1138,6 +1180,70 @@ class SqliteRepository:
                                      quarantined=art.trust_level is TrustLevel.QUARANTINED):
                 raise NotAuthorized(f"{actor.kind.value} may not read {art.artifact_class.value} artifact {artifact_id}")
         return art
+
+    def remove_orphaned_artifact(self, artifact_id: str, actor: Actor) -> Artifact:
+        """Human-only. Only an orphaned artifact can be removed (also enforced by a DB trigger)."""
+        with self._denial_scope(actor, "artifact.remove_orphan"), self._tx() as conn:
+            self._check_actor(conn, actor)
+            authorize(actor.kind, "artifact.remove_orphan")
+            row = conn.execute("SELECT orphaned, removed_at_ms FROM artifacts WHERE artifact_id=?", (artifact_id,)).fetchone()
+            if row is None:
+                raise NotFound(f"artifact {artifact_id!r}")
+            if not row["orphaned"]:
+                raise GuardFailed("remove_orphan", "only an orphaned artifact can be removed")
+            if row["removed_at_ms"] is not None:
+                return self.get_artifact(artifact_id)
+            conn.execute("UPDATE artifacts SET removed_at_ms=?, removed_by=? WHERE artifact_id=?", (self.clock.now_ms(), actor.id, artifact_id))
+            self._append_event(conn, "artifact.removed", actor, payload={"artifact_id": artifact_id})
+        return self.get_artifact(artifact_id)
+
+    def hold_for_human_review(self, task_id: str, kind: str, payload: dict[str, Any], *, actor: Actor = SYSTEM) -> TaskRecord:
+        """Billing-integrity (or similar) hold: audited, and from now on ONLY a human may review/accept the task."""
+        if kind not in ("billing.integrity_mismatch",):
+            raise ValueError(f"unsupported hold kind {kind!r}")
+        with self._denial_scope(actor, "task.hold_review", task_id), self._tx() as conn:
+            self._check_actor(conn, actor)
+            authorize(actor.kind, "task.hold_review")
+            task = self._load_task(conn, task_id)
+            if task.state not in TERMINAL_STATES:
+                conn.execute("UPDATE tasks SET review_hold=1 WHERE task_id=?", (task_id,))
+            self._append_event(conn, kind, actor, task_id=task_id, payload={**payload, "held_for_human_review": task.state not in TERMINAL_STATES})
+            return self._load_task(conn, task_id)
+
+    def record_reconciliation(self, pool_budget_id: str, remaining_usd_micro: int, actor: Actor, note: str = "") -> ReconciliationResult:
+        """HUMAN-only. The operator copies the remaining credit from the provider's account page. The entry aligns our estimate with reality.
+        Drift above the threshold (15 % of the cap) is flagged. If our estimate ran LOWER than reality (we under-counted consumption), the
+        pool and this month's allocations are frozen: the next grant must be human-approved to unfreeze them."""
+        with self._denial_scope(actor, "budget.reconcile"), self._tx() as conn:
+            self._check_actor(conn, actor)
+            authorize(actor.kind, "budget.reconcile")
+            row = conn.execute("SELECT * FROM budgets WHERE budget_id=? AND scope='pool'", (pool_budget_id,)).fetchone()
+            if row is None:
+                raise NotFound(f"credit pool {pool_budget_id!r}")
+            if remaining_usd_micro < 0:
+                raise GuardFailed("reconcile", "remaining credit cannot be negative")
+            eff_u, _ = budget_sql.effective_limits(conn, row)
+            used_u, _ = budget_sql.usage(conn, pool_budget_id)
+            est_remaining = eff_u - used_u
+            delta = est_remaining - remaining_usd_micro     # > 0: reality is LOWER than we estimated (we under-counted spending)
+            drift_ppm = abs(delta) * 1_000_000 // max(eff_u, 1)
+            flagged = drift_ppm > self.limits.drift_flag_ratio_ppm
+            frozen = flagged and delta > 0
+            entry_id = self._new_id()
+            conn.execute(
+                "INSERT INTO budget_ledger(entry_id,budget_id,task_id,run_id,kind,usd_micro,tokens,wall_s,approval_id,idempotency_key,"
+                "created_at_ms,attempt,reserve_ref,recorded_by,flagged) VALUES(?,?,NULL,NULL,'reconciliation',?,0,0,NULL,?,?,NULL,NULL,?,?)",
+                (entry_id, pool_budget_id, delta, f"reconcile:{entry_id}", self.clock.now_ms(), actor.id, int(flagged)))
+            if frozen:
+                month = pool_budget_id.rsplit(":", 1)[1]
+                conn.execute("UPDATE budgets SET state='frozen' WHERE scope IN ('pool','alloc') AND budget_id LIKE ?", (f"%:{month}",))
+            self._append_event(conn, "budget.reconciled", actor, payload={
+                "pool": pool_budget_id, "remaining_reported_usd_micro": remaining_usd_micro, "estimated_remaining_usd_micro": est_remaining,
+                "delta_usd_micro": delta, "drift_ppm": drift_ppm, "flagged": flagged, "frozen": frozen, "note": note[:500]})
+            if flagged:
+                self._append_event(conn, "budget.drift_flagged", actor, payload={"pool": pool_budget_id, "drift_ppm": drift_ppm,
+                                                                                "estimate_ran_lower_than_reality": delta > 0})
+            return ReconciliationResult(entry_id, delta, drift_ppm, flagged, frozen)
 
     def release_artifact(self, artifact_id: str, actor: Actor) -> Artifact:
         """Human releases a quarantined artifact to `untrusted` (never directly to trusted)."""
@@ -1154,7 +1260,9 @@ class SqliteRepository:
     def record_system_event(self, event_type: str, payload: dict[str, Any], task_id: str | None = None,
                             actor: Actor = SYSTEM) -> AuditEvent:
         """Audited errors raised outside a state change (e.g. routing failures). Event types are allow-listed."""
-        if event_type not in {"agent.route_failed", "worker.error", "adapter.response_rejected", "adapter.response_received"}:
+        if event_type not in {"agent.route_failed", "worker.error", "adapter.response_rejected", "adapter.response_received",
+                              "env.forbidden_refused", "env.forbidden_present_on_host", "billing.integrity_mismatch", "quota.probe",
+                              "egress.denied"}:
             raise ValueError(f"event type {event_type!r} is not allowed here")
         with self._denial_scope(actor, "audit.append_system_event", task_id), self._tx() as conn:
             self._check_actor(conn, actor)
@@ -1174,7 +1282,8 @@ class SqliteRepository:
             artifact_class=r["artifact_class"], logical_name=r["logical_name"], storage_uri=r["storage_uri"],
             producer_run_id=r["producer_run_id"], producer_principal_id=r["producer_principal_id"],
             trust_level=r["trust_level"], is_mock=bool(r["is_mock"]), parent_artifact_ids=parents,
-            created_at_ms=r["created_at_ms"], provenance_hash=r["provenance_hash"],
+            created_at_ms=r["created_at_ms"], provenance_hash=r["provenance_hash"], orphaned=bool(r["orphaned"]),
+            orphaned_reason=r["orphaned_reason"], removed_at_ms=r["removed_at_ms"],
         )
 
     # ------------------------------------------------------------ budget API (human gates, queueing, status)
@@ -1211,9 +1320,9 @@ class SqliteRepository:
                 if not res.ok:
                     if event is Event.QUEUE:
                         return self._apply(conn, task, Event.BLOCK, SYSTEM,
-                                           GuardContext(block_reason=BlockReason.BUDGET_INSUFFICIENT),
+                                           GuardContext(block_reason=BlockReason.CREDIT_EXHAUSTED if res.credit else BlockReason.BUDGET_INSUFFICIENT),
                                            reason=f"queue refused: {res.reason}")
-                    raise BudgetInsufficient(res.reason or "insufficient budget")
+                    raise BudgetInsufficient(res.reason or "insufficient budget", credit=res.credit)
             return self._apply(conn, task, event, actor, ctx or GuardContext(), reason=reason)
 
     def queue_task(self, task_id: str, expected_version: int, *, actor: Actor = SYSTEM) -> TaskRecord:
@@ -1239,7 +1348,7 @@ class SqliteRepository:
                 raise GuardFailed("budget_increase", "task is terminal")
             if usd_micro < 0 or tokens < 0 or (usd_micro == 0 and tokens == 0):
                 raise GuardFailed("budget_increase", "amount must be positive")
-            if budget_id.split(":", 1)[0] not in ("task", "root", "global", "role"):
+            if budget_id.split(":", 1)[0] not in ("task", "root", "global", "role", "pool", "alloc"):
                 raise GuardFailed("budget_increase", f"unknown budget {budget_id!r}")
             row = conn.execute(
                 "SELECT * FROM approvals WHERE task_id=? AND approval_type='budget_increase' AND task_version=? AND budget_id=? "
@@ -1299,8 +1408,11 @@ class SqliteRepository:
                     budget_sql.ensure_budget(conn, bid, "root", ref, self.limits.default_root_usd_micro, self.limits.default_root_tokens, "system", now)
                 elif kind == "global":
                     budget_sql.ensure_budget(conn, bid, "global_daily", ref, self.limits.default_global_daily_usd_micro, self.limits.default_global_daily_tokens, "system", now)
-                elif kind == "role":
-                    budget_sql.ensure_budget(conn, bid, "role", ref, self.limits.real_adapter_default_usd_micro, self.limits.real_adapter_default_tokens, "system", now)
+                elif kind == "pool":
+                    budget_sql.ensure_budget(conn, bid, "pool", ref, self.limits.agent_sdk_credit_monthly_cap_usd_micro, self.limits.pool_token_limit, "system", now)
+                elif kind == "alloc":
+                    role_name = ref.split(":")[0]
+                    budget_sql.ensure_budget(conn, bid, "alloc", ref, self.limits.role_allocations_usd_micro.get(role_name, 0), self.limits.pool_token_limit, "system", now)
                 entry_id = self._new_id()
                 conn.execute(
                     "INSERT INTO budget_ledger(entry_id,budget_id,task_id,run_id,kind,usd_micro,tokens,wall_s,approval_id,"
@@ -1308,6 +1420,8 @@ class SqliteRepository:
                     (entry_id, bid, task.task_id, row["amount_usd_micro"], row["amount_tokens"], approval_id,
                      f"grant:{approval_id}", now))
                 budget_sql.reactivate_if_within_limit(conn, bid)
+                if kind in ("pool", "alloc"):
+                    budget_sql.unfreeze_credit_budgets(conn)  # the human-approved grant clears a reconciliation freeze
                 self._append_event(conn, "budget.granted", actor, task_id=task.task_id, payload={
                     "approval_id": approval_id, "budget_id": bid, "usd_micro": row["amount_usd_micro"],
                     "tokens": row["amount_tokens"], "decided_by": row["decided_by"]})
@@ -1339,7 +1453,8 @@ class SqliteRepository:
         return BudgetLedgerEntry(
             entry_id=r["entry_id"], budget_id=r["budget_id"], task_id=r["task_id"], run_id=r["run_id"],
             kind=LedgerKind(r["kind"]), usd_micro=r["usd_micro"], tokens=r["tokens"], wall_s=r["wall_s"],
-            approval_id=r["approval_id"], attempt=r["attempt"], reserve_ref=r["reserve_ref"],
+            approval_id=r["approval_id"], attempt=r["attempt"], reserve_ref=r["reserve_ref"], recorded_by=r["recorded_by"],
+            flagged=bool(r["flagged"]),
             idempotency_key=r["idempotency_key"], created_at_ms=r["created_at_ms"],
         )
 

@@ -23,10 +23,14 @@ def _u(model, tin=0, tout=0, reported=0):
     return ResourceUsage(tokens_in=tin, tokens_out=tout, usd_micro=reported, wall_ms=1, measured_by="adapter", model=model)
 
 
+def _entry(name, i, o):
+    return {"model_id": name, "input": i, "output": o, "source_url": "test:synthetic-not-a-real-price", "retrieved_at": "2026-01-01"}
+
+
 def _table(**models):
-    return PriceTable.from_dict({"schema": "airos-prices/1", "version": "t", "currency": "USD",
+    return PriceTable.from_dict({"schema": "airos-prices/2", "version": "t", "currency": "USD",
                                  "unit": "usd_micro_per_million_tokens",
-                                 "models": {k: {"input": v[0], "output": v[1]} for k, v in models.items()}})
+                                 "models": {k: _entry(k, v[0], v[1]) for k, v in models.items()}})
 
 
 # ------------------------------------------------------------------ the table itself
@@ -45,8 +49,8 @@ def test_cost_is_exact_integer_arithmetic_rounded_up():
 
 
 def test_table_is_validated_hashed_and_pinned():
-    data = {"schema": "airos-prices/1", "version": "v", "currency": "USD", "unit": "usd_micro_per_million_tokens",
-            "models": {"m": {"input": 1, "output": 2}}}
+    data = {"schema": "airos-prices/2", "version": "v", "currency": "USD", "unit": "usd_micro_per_million_tokens",
+            "models": {"m": _entry("m", 1, 2)}}
     t1 = PriceTable.from_dict(data)
     assert t1 == PriceTable.from_dict(copy.deepcopy(data)) and len(t1.sha256) == 64
     changed = copy.deepcopy(data)
@@ -54,9 +58,20 @@ def test_table_is_validated_hashed_and_pinned():
     assert PriceTable.from_dict(changed).sha256 != t1.sha256
     with pytest.raises(SchemaMismatch, match="pinned"):
         PriceTable.from_dict(changed, expected_sha256=t1.sha256)
-    for bad in ({"input": -1, "output": 0}, {"input": 1.5, "output": 0}, {"input": True, "output": 0}, {"input": 1}):
+    for bad in ({**_entry("m", -1, 0)}, {**_entry("m", 1.5, 0)}, {**_entry("m", True, 0)}, {"model_id": "m", "input": 1}):
         with pytest.raises(SchemaMismatch):
             PriceTable.from_dict({**data, "models": {"m": bad}})
+    # provenance is mandatory: every entry needs model_id, source_url and retrieved_at, else the table is refused (fail closed)
+    for drop in ("model_id", "source_url", "retrieved_at"):
+        e = _entry("m", 1, 2)
+        del e[drop]
+        with pytest.raises(SchemaMismatch, match="exactly"):
+            PriceTable.from_dict({**data, "models": {"m": e}})
+    for field, value in (("source_url", ""), ("source_url", "   "), ("retrieved_at", "not-a-date"), ("retrieved_at", ""), ("model_id", "other")):
+        with pytest.raises(SchemaMismatch):
+            PriceTable.from_dict({**data, "models": {"m": {**_entry("m", 1, 2), field: value}}})
+    with pytest.raises(SchemaMismatch):                                      # the retired v1 schema (no provenance) is not accepted
+        PriceTable.from_dict({**data, "schema": "airos-prices/1"})
     for key in ("schema", "unit", "currency"):
         with pytest.raises(SchemaMismatch):
             PriceTable.from_dict({**data, key: "x"})
@@ -70,7 +85,7 @@ def test_packaged_default_table_is_pinned_and_contains_no_invented_prices(tmp_pa
     from importlib import resources
 
     raw = json.loads(resources.files("airos.pricing_data").joinpath("prices-v1.json").read_text())
-    raw["models"]["sneaky"] = {"input": 0, "output": 0}
+    raw["models"]["sneaky"] = _entry("sneaky", 0, 0)
     p = tmp_path / "prices.json"
     p.write_text(json.dumps(raw))
     with pytest.raises(SchemaMismatch, match="pinned"):
@@ -141,8 +156,8 @@ def test_run_record_pins_the_price_table_version_and_hash_in_force(open_repo, db
     assert (run1.price_table_version, run1.price_table_sha256) == (a.price_table.version, a.price_table.sha256)
     # a different table later: the OLD run keeps the hash it was priced with
     b = SqliteRepository(db_path, clock=clock, price_table=PriceTable.from_dict(
-        {"schema": "airos-prices/1", "version": "t2", "currency": "USD", "unit": "usd_micro_per_million_tokens",
-         "models": {"m": {"input": 9_000_000, "output": 0}}}))
+        {"schema": "airos-prices/2", "version": "t2", "currency": "USD", "unit": "usd_micro_per_million_tokens",
+         "models": {"m": _entry("m", 9_000_000, 0)}}))
     assert b.list_runs(t1.task_id)[0].price_table_sha256 == a.price_table.sha256 != b.price_table.sha256
     assert any(e.event_type == "budget.settled" and e.payload["price_table_sha256"] == a.price_table.sha256 for e in b.iter_events())
     b.close()
@@ -158,18 +173,28 @@ def test_mock_adapters_are_priced_at_zero_by_the_default_table(repo):
 
 
 def test_real_adapter_without_a_price_entry_fails_closed_even_with_credentials(repo):
+    from datetime import date
+
+    from airos.agents.registry import RegistryPolicy
+
     table = _table(**{"priced-model": (1, 1)})
     env = {"K": FAKE_KEY}
-    for model in (None, "", "unpriced-model", "PRICED-MODEL"):
-        reg = AgentRegistry([AgentSpec(role="executor", kind="real", credential_env="K", model=model)], all_mock_adapters(), env, table)
+    policy = RegistryPolicy(usage_credits_attested_off=True, attested_on=date(2026, 1, 1), today=lambda: date(2026, 11, 7),
+                            model_allowlist={"executor": frozenset({"priced-model", "unpriced-model", "PRICED-MODEL"})})
+
+    def spec(model):
+        return AgentSpec(role="executor", kind="real", credential_env="K", model=model)
+
+    for model in (None, ""):                                                  # no model at all is refused before the price gate
+        with pytest.raises(AdapterUnavailable, match="no model configured"):
+            AgentRegistry([spec(model)], all_mock_adapters(), env, table, policy=policy).resolve("executor")
+    for model in ("unpriced-model", "PRICED-MODEL"):
         with pytest.raises(AdapterUnavailable, match="no entry in price table"):
-            reg.resolve("executor")
-    # with a price entry the NEXT gate is reached (no implementation in M2/this registry): still fail-closed
-    reg = AgentRegistry([AgentSpec(role="executor", kind="real", credential_env="K", model="priced-model")], all_mock_adapters(), env, table)
+            AgentRegistry([spec(model)], all_mock_adapters(), env, table, policy=policy).resolve("executor")
+    # with a price entry the NEXT gate is reached (no factory registered here): still fail-closed
     with pytest.raises(AdapterUnavailable, match="no real adapter implementation"):
-        reg.resolve("executor")
+        AgentRegistry([spec("priced-model")], all_mock_adapters(), env, table, policy=policy).resolve("executor")
     # order of gates: credentials are checked before the price
-    reg = AgentRegistry([AgentSpec(role="executor", kind="real", credential_env="K", model="priced-model")], all_mock_adapters(), {}, table)
     with pytest.raises(AdapterUnavailable, match="no configured credentials"):
-        reg.resolve("executor")
+        AgentRegistry([spec("priced-model")], all_mock_adapters(), {}, table, policy=policy).resolve("executor")
     assert Role.EXECUTOR

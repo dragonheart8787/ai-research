@@ -17,12 +17,18 @@
     "artifact.release": [
       "human"
     ],
+    "artifact.remove_orphan": [
+      "human"
+    ],
     "audit.append_system_event": [
       "system"
     ],
     "budget.grant": [
       "human",
       "system"
+    ],
+    "budget.reconcile": [
+      "human"
     ],
     "budget.request_increase": [
       "human",
@@ -145,6 +151,9 @@
     ],
     "task.create_root_as_director": [
       "director"
+    ],
+    "task.hold_review": [
+      "system"
     ]
   },
   "artifact_read": {

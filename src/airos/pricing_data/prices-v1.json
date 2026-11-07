@@ -1,16 +1,22 @@
 {
-  "schema": "airos-prices/1",
-  "version": "2026-11-v2",
+  "schema": "airos-prices/2",
+  "version": "2026-11-v3",
   "currency": "USD",
   "unit": "usd_micro_per_million_tokens",
   "models": {
     "mock": {
+      "model_id": "mock",
       "input": 0,
-      "output": 0
+      "output": 0,
+      "source_url": "internal:no-provider-cost",
+      "retrieved_at": "2026-11-07"
     },
     "handoff": {
+      "model_id": "handoff",
       "input": 0,
-      "output": 0
+      "output": 0,
+      "source_url": "internal:no-provider-cost",
+      "retrieved_at": "2026-11-07"
     }
   }
 }

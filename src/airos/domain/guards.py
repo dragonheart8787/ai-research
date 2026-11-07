@@ -125,12 +125,14 @@ def retry_allowed(i: GuardInput) -> str | None:
         return "error is not retryable"
     if i.facts.side_effectful:
         return "side-effectful tasks are never auto-retried"
-    if i.task.attempt_count >= 1 + i.task.contract.resource_limits.max_retries:
+    if i.task.attempt_count - i.task.uncounted_attempts >= 1 + i.task.contract.resource_limits.max_retries:
         return "retries exhausted"
     return None
 
 
 def reviewer_ok(i: GuardInput) -> str | None:
+    if i.task.review_hold and i.actor.kind is not ActorKind.HUMAN:
+        return "billing-integrity hold: only a human may review this task"
     if i.facts.producer_id is not None and i.actor.id == i.facts.producer_id:
         return "reviewer must not be the producer of the run under review"
     needs_human = i.task.contract.human_review_required or i.task.assigned_role in HUMAN_REVIEW_ROLES
@@ -145,7 +147,7 @@ def rework_allowed(i: GuardInput) -> str | None:
         return r
     if i.task.review_cycles >= i.limits.max_review_cycles:
         return "review cycles exhausted"
-    if i.task.attempt_count >= 1 + i.task.contract.resource_limits.max_retries:
+    if i.task.attempt_count - i.task.uncounted_attempts >= 1 + i.task.contract.resource_limits.max_retries:
         return "attempts exhausted"
     return None
 
