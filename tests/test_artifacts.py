@@ -306,3 +306,25 @@ def test_human_import_of_scientist_output_is_quarantined(svc):
     art = svc.import_bytes(data=b"s", artifact_id="sci-h", logical_name="s.txt", media_type="text/plain",
                            artifact_class=ArtifactClass.SCIENTIST_OUTPUT, human=HUMAN)
     assert art.trust_level is TrustLevel.QUARANTINED
+
+
+def test_lineage_is_transitive_and_verify_all_checks_every_artifact_and_edge(repo, svc, store, tmp_path):
+    t, run = _running(repo, Role.EXECUTOR, EXECUTOR)
+    rd = tmp_path / "run"
+    rd.mkdir()
+    root = svc.import_bytes(data=b"r", artifact_id="root", logical_name="r.txt", media_type="text/plain",
+                            artifact_class=ArtifactClass.REQUEST, human=HUMAN)
+    c = make_contract(input_artifact_refs=[ArtifactRef(artifact_id="root", sha256=root.sha256)])
+    t2 = approve_fully(repo, repo.create_task(c, HUMAN).task)
+    t2 = repo.queue_task(t2.task_id, t2.version)
+    run2 = repo.start_run(t2.task_id, "w2", EXECUTOR.id, t2.version)
+    rd2 = tmp_path / "run2"
+    rd2.mkdir()
+    svc.ingest(run_dir=rd2, produced=_produce(rd2, "a.txt", b"a", parents=["root"]), run_id=run2.run_id, task=t2, artifact_id="a", is_mock=True)
+    svc.ingest(run_dir=rd2, produced=_produce(rd2, "b.txt", b"b", parents=["a"]), run_id=run2.run_id, task=t2, artifact_id="b", is_mock=True)
+    assert svc.lineage("b") == ["a", "root"] and svc.lineage("root") == []
+    assert set(svc.verify_all()) == {"root", "a", "b"} and all(r.ok for r in svc.verify_all().values())
+    os.chmod(store.path_for(sha256_hex(b"a")), 0o644)
+    store.path_for(sha256_hex(b"a")).write_bytes(b"tampered")
+    res = svc.verify_all()
+    assert not res["a"].ok and res["root"].ok and res["b"].ok          # exactly the tampered artifact is reported

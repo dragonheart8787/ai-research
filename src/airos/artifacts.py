@@ -188,6 +188,30 @@ class ArtifactService:
                 problems.append(f"parent artifact {pid} is missing")
         return VerifyResult(not problems, problems)
 
+    def lineage(self, artifact_id: str) -> list[str]:
+        """All transitive ancestors (parents first-found order, no duplicates). Raises if a parent is missing."""
+        seen: list[str] = []
+        stack = list(self.repo.get_artifact(artifact_id).parent_artifact_ids)
+        while stack:
+            cur = stack.pop(0)
+            if cur in seen:
+                continue
+            seen.append(cur)
+            stack.extend(self.repo.get_artifact(cur).parent_artifact_ids)
+        return seen
+
+    def verify_all(self) -> dict[str, VerifyResult]:
+        """Recompute content hash + provenance for EVERY registered artifact and check every lineage edge resolves."""
+        out: dict[str, VerifyResult] = {}
+        for a in self.repo.list_artifacts():
+            res = self.verify(a.artifact_id)
+            try:
+                self.lineage(a.artifact_id)
+            except Exception as exc:  # noqa: BLE001
+                res = VerifyResult(False, [*res.problems, f"lineage broken: {exc}"])
+            out[a.artifact_id] = res
+        return out
+
     def read(self, actor: Actor, artifact_id: str, for_task_id: str | None = None) -> bytes:
         """Authorize via the matrix FIRST (denials audited), then read and re-verify the hash before returning bytes."""
         art = self.repo.authorize_artifact_read(actor, artifact_id, for_task_id)

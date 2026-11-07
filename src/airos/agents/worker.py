@@ -33,6 +33,7 @@ from airos.errors import (
     IntegrityError,
     LeaseLost,
     LimitExceeded,
+    NotAuthorized,
     UnsafePath,
     VersionConflict,
 )
@@ -232,6 +233,12 @@ class Worker:
             return
         except AdapterProtocolError as exc:
             self._reject(task, run_id, exc.category, exc.detail, None, adapter)
+            return
+        except NotAuthorized as exc:  # the adapter tried to read something its role may not read: policy, never retried
+            self._reject(task, run_id, "policy", f"permission denied while running: {exc}", None, adapter)
+            return
+        except ValidationError as exc:  # the adapter tried to build an invalid AgentResponse: malformed output
+            self._reject(task, run_id, "malformed", f"invalid adapter output ({exc.error_count()} validation error(s))", None, adapter)
             return
         except Exception as exc:  # adapter crash: transient, retried within limits
             self._fail(run_id, retryable=True, error_class="adapter_error", detail=f"adapter raised {type(exc).__name__}: {exc}")

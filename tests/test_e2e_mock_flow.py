@@ -126,6 +126,8 @@ def test_full_mock_flow_request_to_completion(repo, tmp_path):
     assert arts["notes.md"].trust_level is TrustLevel.UNTRUSTED          # ChatGPT Work output is untrusted
     assert arts["result.md"].trust_level is TrustLevel.TRUSTED
     assert all(svc.verify(a.artifact_id).ok for a in arts.values())
+    res = svc.verify_all()                                              # PROPOSAL M3: provenance recomputes for 100% of artifacts
+    assert set(res) == {a.artifact_id for a in arts.values()} and all(r.ok for r in res.values())
     ledger = repo.list_ledger()
     reserves = {e.entry_id for e in ledger if e.kind.value == "reserve"}
     assert reserves and sorted(e.reserve_ref for e in ledger if e.kind.value == "release") == sorted(reserves)  # all closed

@@ -4,7 +4,7 @@ Autonomous AI Research Operating System: a multi-agent control plane whose first
 
 - Design: [`docs/architecture/PROPOSAL.md`](docs/architecture/PROPOSAL.md), decisions in [`docs/adr/`](docs/adr/README.md).
 - Status: **M1** (domain + persistence) and **M2** (governance: budgets, authorization, approvals, artifacts, mock agents, minimal API) implemented;
-  see [`M1-NOTES.md`](docs/architecture/M1-NOTES.md) and [`M2-NOTES.md`](docs/architecture/M2-NOTES.md).
+  see [`M1-NOTES.md`](docs/architecture/M1-NOTES.md), [`M2-NOTES.md`](docs/architecture/M2-NOTES.md); **M3** (real adapters behind fixtures, git handoff) in [`M3-NOTES.md`](docs/architecture/M3-NOTES.md).
 
 ## Develop (Python 3.11+)
 

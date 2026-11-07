@@ -1160,6 +1160,9 @@ class SqliteRepository:
             self._check_actor(conn, actor)
             authorize(actor.kind, "audit.append_system_event")
             return self._append_event(conn, event_type, actor, task_id=task_id, payload=payload)
+    def list_artifacts(self) -> list[Artifact]:
+        return [self.get_artifact(r[0]) for r in self._read().execute("SELECT artifact_id FROM artifacts ORDER BY created_at_ms, artifact_id")]
+
     def get_artifact(self, artifact_id: str) -> Artifact:
         r = self._read().execute("SELECT * FROM artifacts WHERE artifact_id=?", (artifact_id,)).fetchone()
         if r is None:

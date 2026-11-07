@@ -18,7 +18,7 @@ from urllib.parse import urlsplit
 
 from airos.errors import AirosError
 
-SENSITIVE_HEADERS = frozenset({"authorization", "x-api-key", "proxy-authorization", "cookie"})
+SENSITIVE_HEADERS = frozenset({"authorization", "x-api-key", "proxy-authorization", "cookie", "set-cookie"})
 
 
 class TransportError(AirosError):

@@ -196,3 +196,33 @@ def real_world(repo: Any, tmp_path: Path, *, fixtures: dict[str, list[dict[str, 
     svc = ArtifactService(repo, ArtifactStore(tmp_path / "cas", tmp_path / "eval"))
     worker = Worker(repo, reg, FreshDirRunner(tmp_path / "ws"), svc, "w-real")
     return World(worker, reg, svc, loop, transports)
+
+
+# --------------------------------------------------------------------- task builders for worker-level real-adapter tests
+OUTPUT_FOR = {
+    "director": ExpectedOutput(logical_name="out.md", media_type="text/markdown", artifact_class="plan"),
+    "planner": ExpectedOutput(logical_name="out.md", media_type="text/markdown", artifact_class="plan"),
+    "executor": ExpectedOutput(logical_name="result.md", media_type="text/markdown", artifact_class="work_product"),
+    "chatgpt_work": ExpectedOutput(logical_name="notes.md", media_type="text/markdown", artifact_class="external_handoff"),
+}
+
+
+def role_contract(role: str, **over: Any) -> Any:
+    reqs = [ApprovalRequirement(type=t, reason="x") for t in (ApprovalType.EXECUTE, ApprovalType.COST, ApprovalType.EXTERNAL_HANDOFF)]
+    base: dict[str, Any] = {"assigned_role": Role(role), "approval_requirements": reqs, "expected_output": [OUTPUT_FOR[role]],
+                            "allowed_actions": ["fs.read", "fs.write.workspace"] if role == "executor" else []}
+    base.update(over)
+    return make_contract(**base)
+
+
+def grant_role_budget(repo: Any, task: Any, role: str, usd: int = 5_000_000, tokens: int = 5_000_000) -> None:
+    from tests.conftest import HUMAN, PLANNER
+
+    ap = repo.request_budget_increase(task.task_id, f"role:{role}", usd, tokens, PLANNER)
+    repo.decide_approval(ap.approval_id, True, HUMAN, "grant role budget")
+    repo.grant_budget(ap.approval_id)
+
+
+def result_writer(spec: LoopSpec) -> None:
+    (spec.cwd / "out").mkdir(exist_ok=True)
+    (spec.cwd / "out" / "result.md").write_bytes(b"# executor result\n")
