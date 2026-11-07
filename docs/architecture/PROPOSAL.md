@@ -5,6 +5,8 @@
 - Scope of this document: environment inspection and design only. No implementation code, no installs, no external API calls, no containers, no GPU/training work were performed or are authorised by this document.
 - Codename used below: `airos` (Python package), "control plane" = the single FastAPI process that owns state.
 
+**Authentication amendment (2026-11-07, ADR-0011):** the system never uses provider API keys; `auth_mode` is `subscription_oauth` or `manual_handoff` only; the Q6 decision (dedicated API key) is **withdrawn**; adapters are disabled by default and Claude-driven ones need a human attestation that "usage credits" are OFF. **Scope note (ADR-0012):** real adapters appeared in M3, fixture-only.
+
 **M2 amendments (see `M2-NOTES.md`):** agents cannot cancel (human-only); reservation precedes `queued`; per-task limit = cap x attempts; permissions matrix is `src/airos/security/permissions.json`.
 
 **Amendments (2026-11-06, human review "approved with changes"):** see ADR-0009 (approval binding to task version + contract hash), the revised §5.3 anchoring, §7 operator-token authentication, §11.2 Q6 decision, §4.3 concurrency/Clock notes and §11.4 untrusted-input rule. Where this text and an ADR disagree, the newer ADR wins.
@@ -486,7 +488,7 @@ Required approvals for a task, computed deterministically at T03/T04 from its co
 | Cleanup | `--rm` plus label `airos.run_id`; workspace deleted or archived 7 d after terminal. |
 
 ### 11.2 Secrets
-Secrets come only from environment variables or a secret store (e.g. Docker secrets/`/run/secrets`, sops-encrypted file outside the repo); never from the repo; `.gitignore` covers `.env*`, `data/`, `secrets/`. M4 decision (Q6): the Executor uses a **dedicated API key with a provider-side spend cap**, passed as a single env var to that container only. Egress-proxy key injection is deferred hardening and **not in scope** for M1–M5. All loaded secret values are registered with the `Redactor`, which (a) masks exact values (min length 8), (b) masks patterns (`sk-…`, `sk-ant-…`, `ghp_…`, `github_pat_…`, `AKIA…`, JWTs, PEM blocks), and (c) is applied to log records, event payloads, error details, captured stdout/stderr, and text artifacts at ingest — an artifact in which a secret is detected is rejected (`policy`, non-retryable) and not stored. CI runs secret scanning on every change.
+Secrets come only from environment variables or a secret store (e.g. Docker secrets/`/run/secrets`, sops-encrypted file outside the repo); never from the repo; `.gitignore` covers `.env*`, `data/`, `secrets/`. **Superseded by ADR-0011 (2026-11-07): no provider API keys exist.** Credentials are per-adapter subscription OAuth tokens (Claude: `CLAUDE_CODE_OAUTH_TOKEN` inside that adapter's container only; Codex: a dedicated login volume mounted only into the Director container). All loaded secret values are registered with the `Redactor`, which (a) masks exact values (min length 8), (b) masks patterns (`sk-…`, `sk-ant-…`, `ghp_…`, `github_pat_…`, `AKIA…`, JWTs, PEM blocks), and (c) is applied to log records, event payloads, error details, captured stdout/stderr, and text artifacts at ingest — an artifact in which a secret is detected is rejected (`policy`, non-retryable) and not stored. CI runs secret scanning on every change.
 
 ### 11.3 Final-evaluation data
 Stored at `/var/lib/airos-eval/holdout/` (configurable), owned by a dedicated OS user `airos-eval` mode `0700`, **outside** the repo, `data/`, and every workspace root. It is not representable in any container spec: the sandbox runner's mount validator rejects any source under that prefix, and the path is on the denylist and excluded from artifact-class resolution. Only the host-side Evaluator (a deterministic process with no LLM and no network) reads it, and it returns scores (`eval_result`) only. Test: a contract/run-spec that attempts to mount it, or a symlink resolving into it, is rejected before `docker run`.
@@ -610,7 +612,7 @@ Each milestone starts only after the human replies "approved" for that milestone
 | Q3 | Handoff repository for ChatGPT Work: separate repo or branch of this one? | Separate **private** repo `ai-research-handoff`; token scoped to it only |
 | Q4 | Where to anchor audit head hashes? | **DECIDED:** append head hash to a file on a separate volume on every human approval and root-objective completion; human commits it weekly |
 | Q5 | Docker host for M4/M5 (this sandbox has no daemon)? | Human-supplied Linux VM with rootless Docker; develop M1–M3 here |
-| Q6 | Executor API credential handling | **DECIDED:** dedicated key with provider-side spend cap (M4); proxy injection deferred |
+| Q6 | Executor credential handling | **WITHDRAWN/REPLACED (ADR-0011):** subscription OAuth only; no API keys |
 | Q7 | AI Scientist v3 source, license, network/GPU needs? | Pin to a reviewed commit digest, CPU-only, no outbound network except its single LLM host, M5 only |
 | Q8 | Who reviews Director/Planner-produced outputs? | Human review mandatory (already in T23 guard) |
 | Q9 | Number of human operators / is SSO needed? | Single operator now (operator token from `AIROS_OPERATOR_TOKEN`); schema supports many principals |

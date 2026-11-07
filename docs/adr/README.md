@@ -14,3 +14,5 @@ Format: Status / Context / Decision / Consequences / Alternatives. Date of all i
 | [0008](0008-humans-only-approvals-and-no-agent-api-access.md) | Humans are the only approvers; agents have no API access |
 | [0009](0009-approval-binding-to-task-version-and-contract-hash.md) | Approvals bind to task version and contract hash |
 | [0010](0010-real-adapters-fixture-only-and-fail-closed.md) | Real adapters ship fixture-tested, network-seamed and fail-closed |
+| [0011](0011-subscription-only-authentication.md) | Subscription-only authentication (no provider API keys) |
+| [0012](0012-real-adapters-appeared-in-m3-scope-deviation.md) | Scope deviation: real adapters appeared in M3 |

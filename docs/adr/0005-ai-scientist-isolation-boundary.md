@@ -1,6 +1,6 @@
 # ADR-0005: AI Scientist v3 isolation boundary
 
-- Status: Proposed
+- Status: Proposed (amended 2026-11-07 after the M3 review)
 - Date: 2026-11-06
 
 ## Context
@@ -38,3 +38,34 @@ Further rules:
 - **Separate VM/host:** stronger; adopt later if M5 review finds the Scientist needs more privileges. Orthogonal to this decision.
 - **Shared volume with ACLs:** subtle misconfiguration risk; rejected in favour of one-way copies.
 - **Run the Scientist outside our system entirely and import results manually:** safest and a valid fallback (the manual import path exists); loses orchestration and budget tracking.
+
+## Amendment (M3 review, 2026-11-07)
+
+### AI Scientist v3 is untrusted, full-autonomy code
+Its upstream README launches agents with **full tool permissions** (it writes and executes code, spawns processes, and chooses its own
+commands). We therefore treat it exactly like hostile code that happens to be useful. It may only ever run under all of these, none optional:
+
+1. **Network:** an allowlist of exactly **one provider host**, default deny, denials audited (egress policy as data; see `config/egress.toml`).
+2. **No host mounts.** One scoped writable workspace volume; nothing else. The host `docker.sock` is **never** mounted into any agent container.
+3. **Own credentials only** (one dedicated subscription token or login volume that no other adapter holds; never shared env files).
+4. **Hard caps:** wall-clock limit enforced by the control plane, and a credit allocation (`ai_scientist` = 0 until a human raises it, with approval
+   bound to the contract hash).
+5. **Token-revocation runbook** (below) exercised before first use.
+6. **Final-evaluation data is not mountable** into its container (mount validator denylist + separate OS user/volume).
+7. The adapter remains a **fail-closed stub** until M5; nothing in this repository can start it.
+
+### Token-revocation runbook (any adapter credential)
+1. Stop the control plane (or `enabled=false` for the role in `config/agents.toml`); the role then fails closed at routing.
+2. Revoke the credential at the provider (account page: sign out / revoke the long-lived token or the logged-in device/session).
+3. Remove the host environment variable / delete the dedicated login volume; `docker volume rm` the role's volume.
+4. Search audit rows, artifacts and logs for the old token fragment prefix (redaction should have removed it; a hit is an incident).
+5. Re-issue a NEW credential, update only that role's variable, re-run the human attestation (`usage_credits_attested_off`) and the live check.
+
+### Credential isolation between adapters
+Each adapter has **its own credential** and **never shares a container, volume or env file with another adapter**. The run-spec generator refuses
+a spec that would mount another role's login volume or inject another role's token variable (tested).
+
+### M5 pre-flight (not done now)
+Before AI Scientist is enabled: (a) read and record **how agsci launches Docker** (client library, flags, privileged/socket use) in this ADR;
+(b) confirm no code path requires the host `docker.sock` inside the agent container, and refuse any that does; (c) evaluate running the
+Scientist in a **dedicated rootless-Docker VM** separate from the control-plane host.
