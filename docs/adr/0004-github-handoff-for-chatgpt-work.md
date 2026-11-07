@@ -31,3 +31,10 @@ The "ChatGPT Work Researcher" role must be supported, but we **cannot assume a c
 - **Same repository, branch-based:** fewer repos but mixes untrusted writers with our source and CI secrets; rejected by default.
 - **Shared filesystem/S3 bucket:** adds cloud credentials and does not leverage ChatGPT Work's GitHub integration.
 - **Manual copy/paste only:** retained as fallback, but not scalable or auditable by itself.
+
+## Amendment (M3 fixes, A9): author identity is forgeable; signatures are an optional switch
+Git author name/e-mail are plain metadata that anyone who can push can set to any value, so the author allowlist is a **consistency check, not authentication**.
+The real defense is **repository access control** (who can push to the exchange repository, branch protection, 2FA on that account).
+`require_signature` (`config/agents.toml`, `[roles.chatgpt_work]`) is a switch, **default false**. With it off, an unsigned result is accepted only from an
+allowlisted author **and** always needs human review (`human_review: mandatory`); with it on, an unsigned or unverified result is rejected. A BAD signature
+is rejected in both modes. Handoff output is always untrusted data.

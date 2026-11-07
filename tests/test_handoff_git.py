@@ -20,7 +20,7 @@ from airos.agents.real.handoff import (
 )
 from airos.domain.schemas import ArtifactClass, ExpectedOutput, Role
 from airos.redaction import Redactor
-from tests.real_helpers import KEY_OPENAI, external_workflow, git, make_bare_repo, req
+from tests.real_helpers import TOKEN_PLANNER, external_workflow, git, make_bare_repo, req
 
 AUTHOR = "chatgpt-work@example.invalid"
 OUT = [ExpectedOutput(logical_name="notes.md", media_type="text/markdown", artifact_class="external_handoff")]
@@ -67,13 +67,13 @@ def test_dispatch_writes_a_deterministic_request_and_is_idempotent(bare, tmp_pat
 
 
 def test_request_leaves_the_host_redacted(bare, tmp_path):
-    red = Redactor([KEY_OPENAI])
+    red = Redactor([TOKEN_PLANNER])
     gh = GitHandoff(HandoffConfig(repo_path=bare, allowed_authors=frozenset({AUTHOR}), work_root=tmp_path / "cp"))
     a = ChatGPTWorkHandoffAdapter(git=gh, redactor=red)
-    r = _request(objective=f"research with key {KEY_OPENAI}")
+    r = _request(objective=f"research with key {TOKEN_PLANNER}")
     a.execute(r, tmp_path / "w")
-    assert KEY_OPENAI not in git("show", f"main:requests/{r.task_id}/request.json", cwd=bare)
-    assert KEY_OPENAI not in git("show", f"main:requests/{r.task_id}/request.md", cwd=bare)
+    assert TOKEN_PLANNER not in git("show", f"main:requests/{r.task_id}/request.json", cwd=bare)
+    assert TOKEN_PLANNER not in git("show", f"main:requests/{r.task_id}/request.md", cwd=bare)
 
 
 def test_remote_or_missing_repositories_fail_closed(tmp_path, bare):
@@ -130,15 +130,15 @@ def test_inbound_text_that_looks_like_commands_is_stored_as_inert_non_executable
 
 
 def test_secrets_in_inbound_text_are_redacted_after_the_integrity_check(bare, tmp_path):
-    red = Redactor([KEY_OPENAI])
+    red = Redactor([TOKEN_PLANNER])
     gh = GitHandoff(HandoffConfig(repo_path=bare, allowed_authors=frozenset({AUTHOR}), work_root=tmp_path / "cp"))
     a = ChatGPTWorkHandoffAdapter(git=gh, redactor=red)
     r = _request()
     a.execute(r, tmp_path / "w1")
-    external_workflow(bare, tmp_path, r.task_id, request_sha=_req_sha(a, r), files={"notes.md": f"key {KEY_OPENAI}".encode()})
+    external_workflow(bare, tmp_path, r.task_id, request_sha=_req_sha(a, r), files={"notes.md": f"key {TOKEN_PLANNER}".encode()})
     resp = a.execute(r, tmp_path / "w2")
     data = (tmp_path / "w2" / resp.produced_artifacts[0].path).read_bytes()
-    assert KEY_OPENAI.encode() not in data and b"[REDACTED]" in data
+    assert TOKEN_PLANNER.encode() not in data and b"[REDACTED]" in data
     assert resp.produced_artifacts[0].sha256 == hashlib.sha256(data).hexdigest()
 
 
@@ -347,3 +347,24 @@ def test_only_local_git_is_spawned_with_a_clean_environment(bare, tmp_path, monk
     for _, env, _ in seen:
         assert env["GIT_TERMINAL_PROMPT"] == "0" and env["GIT_CONFIG_NOSYSTEM"] == "1" and os.devnull == env["GIT_CONFIG_GLOBAL"]
         assert not any(k.endswith(("_KEY", "_TOKEN")) for k in env)
+
+
+def test_require_signature_is_a_config_switch_defaulting_to_false(bare, tmp_path):
+    from pathlib import Path as _P
+
+    from airos.agents.real.factory import real_factories
+    from airos.agents.registry import AgentSpec
+    from airos.config import load_agents_config
+    from airos.redaction import Redactor
+
+    cfg = load_agents_config(_P(__file__).resolve().parent.parent / "config" / "agents.toml")
+    handoff = {s.role: s for s in cfg.specs}["chatgpt_work"]
+    assert "require_signature" not in handoff.options                                   # shipped default: off
+    on = load_agents_config((_P(__file__).resolve().parent.parent / "config" / "agents.toml").read_text().replace(
+        "require_signature = false", "require_signature = true"))
+    assert {s.role: s for s in on.specs}["chatgpt_work"].options["require_signature"] == "1"
+    for flag, expected in (({}, False), ({"require_signature": "1"}, True)):
+        spec = AgentSpec(role="chatgpt_work", kind="real", auth_mode="manual_handoff",
+                         options={"repo_path": str(bare), "allowed_authors": "a@example.invalid", "work_root": str(tmp_path / "cp"), **flag})
+        adapter = real_factories().get(__import__("airos.domain.schemas", fromlist=["Role"]).Role.CHATGPT_WORK).build(spec, {}, Redactor())
+        assert adapter.git.cfg.require_signature is expected

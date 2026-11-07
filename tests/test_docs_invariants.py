@@ -34,3 +34,8 @@ def test_adr_0012_exists_and_proposal_points_at_the_auth_amendment():
 def test_no_active_doc_instructs_using_an_api_key():
     p = (DOCS / "architecture" / "PROPOSAL.md").read_text()
     assert "is a dedicated API key" not in p and "passed as a single env var to that container only. Egress-proxy" not in p
+
+
+def test_adr_0004_says_author_metadata_is_forgeable_and_access_control_is_the_defense():
+    text = _adr("0004").lower()
+    assert "forgeable" in text and "repository access control" in text and "require_signature" in text and "default false" in text
