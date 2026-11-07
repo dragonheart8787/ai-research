@@ -69,7 +69,7 @@ class ClaudePlannerAdapter(RealAdapterBase):
         inv = CliInvocation(argv=(*CLAUDE_PLANNER_ARGV, "--model", self.model or ""),
                             env=build_adapter_env("planner", credential_value=token),
                             stdin=self._render_prompt(request, inputs) + "\n\n" + PLANNER_INSTRUCTION,
-                            timeout_s=request.resource_limits.wall_clock_s)
+                            timeout_s=request.resource_limits.wall_clock_s, role="planner", run_id=request.run_id)
         res = runner.run(inv)
         zero = self._usage(0, 0)
         try:
@@ -115,12 +115,13 @@ class CodexDirectorAdapter(RealAdapterBase):
         self.no_api_key_attested = no_api_key_attested
         self.login_confirmed: bool | None = None
 
-    def preflight(self) -> str:
+    def preflight(self, run_id: str = "preflight") -> str:
         """Confirm the login mode. Returns "subscription_oauth" only for a ChatGPT login; anything else fails closed."""
         runner = self._require_isolated_runner()
         if not self.no_api_key_attested:
             raise AdapterProtocolError("billing", "the human has not attested that no API key was created in the account")
-        res = runner.run(CliInvocation(argv=CODEX_LOGIN_STATUS_ARGV, env=build_adapter_env("director"), timeout_s=30))
+        res = runner.run(CliInvocation(argv=CODEX_LOGIN_STATUS_ARGV, env=build_adapter_env("director"), timeout_s=30,
+                                          role="director", run_id=run_id))
         text = f"{res.stdout} {res.stderr}".lower()
         if res.returncode == 0 and "chatgpt" in text and "api key" not in text:
             self.login_confirmed = True
@@ -131,10 +132,11 @@ class CodexDirectorAdapter(RealAdapterBase):
 
     def execute(self, request: AgentRequest, workdir: Path, inputs: InputReader | None = None) -> AgentResponse:
         runner = self._require_isolated_runner()
-        auth = self.preflight()  # every run re-confirms the login mode before any model call
+        auth = self.preflight(request.run_id)  # every run re-confirms the login mode before any model call
         res: CliResult = runner.run(CliInvocation(
             argv=(*CODEX_EXEC_ARGV[:-1], "--model", self.model or "", CODEX_EXEC_ARGV[-1]), env=build_adapter_env("director"),
-            stdin=self._render_prompt(request, inputs), timeout_s=request.resource_limits.wall_clock_s))
+            stdin=self._render_prompt(request, inputs), timeout_s=request.resource_limits.wall_clock_s, role="director",
+            run_id=request.run_id))
         zero = self._usage(0, 0)
         message: str | None = None
         tin = tout = 0

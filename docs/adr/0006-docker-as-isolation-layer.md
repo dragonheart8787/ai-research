@@ -1,6 +1,6 @@
 # ADR-0006: Docker as the isolation layer
 
-- Status: Proposed
+- Status: Proposed (M4a: the spec generator, egress policy and check-runner interface are implemented **spec-only, isolation not verified**; see ADR-0013)
 - Date: 2026-11-06
 
 ## Context

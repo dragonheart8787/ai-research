@@ -35,6 +35,8 @@ class CliInvocation:
     stdin: str | None = None
     timeout_s: int = 60
     cwd: Path | None = None
+    role: str = ""                    # which adapter role this is (the container runner needs it to pick the sandbox profile)
+    run_id: str = ""
 
     def __repr__(self) -> str:  # never print env values (they may include a token)
         return f"CliInvocation(argv={list(self.argv)!r}, env_names={sorted(self.env)!r}, stdin=<{len(self.stdin or '')} chars>)"

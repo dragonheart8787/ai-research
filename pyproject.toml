@@ -29,7 +29,10 @@ filterwarnings = [
     "error",
     "ignore:Using .httpx. with .starlette.testclient. is deprecated:Warning",
 ]
-markers = ["spec_only: checks a container run spec only; isolation NOT verified"]
+markers = [
+    "spec_only: checks a container run spec only; isolation NOT verified",
+    "docker_real: needs a real Docker daemon and AIROS_TEST_DOCKER=1; SKIPPED everywhere else (written in M4a, never executed there)",
+]
 
 [tool.ruff]
 target-version = "py311"

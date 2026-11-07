@@ -9,6 +9,7 @@ from airos.artifacts import safe_resolve_in
 from airos.canonical import sha256_hex
 from airos.domain.schemas import AgentRequest, AgentResponse, response_problems
 from airos.errors import UnsafePath
+from airos.sandbox.checks import CheckItem, CheckRunner, FileCheckRunner, assert_runner_allowed
 
 
 @dataclass(frozen=True)
@@ -18,7 +19,9 @@ class VerifierResult:
 
 
 def verify_response(request: AgentRequest, response: AgentResponse, run_dir: Path,
-                    forbidden: tuple[Path, ...] = ()) -> VerifierResult:
+                    forbidden: tuple[Path, ...] = (), check_runner: CheckRunner | None = None) -> VerifierResult:
+    runner = check_runner if check_runner is not None else FileCheckRunner(forbidden)   # the default never executes anything
+    assert_runner_allowed(runner)
     problems = response_problems(response, request)
     if response.status != "succeeded":
         problems.append(f"response status is {response.status!r}, not 'succeeded'")
@@ -45,15 +48,11 @@ def verify_response(request: AgentRequest, response: AgentResponse, run_dir: Pat
     for c in request.acceptance_criteria:
         if c.mode != "machine" or c.check is None:
             continue
-        chk = c.check
-        try:
-            if chk.type == "file_exists":
-                safe_resolve_in(run_dir, chk.target, forbidden)
-            elif chk.type == "sha256_equals":
-                if sha256_hex(safe_resolve_in(run_dir, chk.target, forbidden).read_bytes()) != chk.expected:
-                    problems.append(f"criterion {c.id}: sha256 differs from expected")
-            else:
-                problems.append(f"criterion {c.id}: check type {chk.type!r} is not supported in M2 (fail closed)")
-        except UnsafePath as exc:
-            problems.append(f"criterion {c.id}: {exc}")
+        res = runner.run(CheckItem.from_spec(c.id, c.check), run_dir)
+        if not res.passed:
+            problems.append(f"criterion {c.id}: check {res.outcome.value}: {res.detail} (fail closed)")
+    for ev in response.evidence:   # evidence is verified too; a claim that cannot be verified is a failure, never a pass
+        res = runner.run(CheckItem.from_evidence(ev), run_dir)
+        if not res.passed:
+            problems.append(f"evidence {ev.check_id}: check {res.outcome.value}: {res.detail} (fail closed)")
     return VerifierResult(not problems, problems)

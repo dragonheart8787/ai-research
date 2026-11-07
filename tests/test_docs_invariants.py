@@ -39,3 +39,14 @@ def test_no_active_doc_instructs_using_an_api_key():
 def test_adr_0004_says_author_metadata_is_forgeable_and_access_control_is_the_defense():
     text = _adr("0004").lower()
     assert "forgeable" in text and "repository access control" in text and "require_signature" in text and "default false" in text
+
+
+def test_m4_docs_label_the_sandbox_spec_only_and_give_the_vm_procedure():
+    arch = DOCS / "architecture"
+    handoff = (arch / "M4B-HANDOFF.md").read_text()
+    for needle in ("git clone", "git checkout claude/m4-sandbox", "requirements/dev.lock", "AIROS_LIVE=1", "AIROS_TEST_DOCKER=1", "snapshot",
+                   "rootless", "dockerd-rootless-setuptool.sh", "exit=3", "do not log in"):
+        assert needle.lower() in handoff.lower(), needle
+    notes = (arch / "M4A-NOTES.md").read_text()
+    assert "Verified by tests vs not verified" in notes and "NOT verified" in notes and "spec-only" in _adr("0013").lower()
+    assert "isolation not verified" in (DOCS.parent / "tests" / "golden" / "sandbox" / "planner.txt").read_text()
