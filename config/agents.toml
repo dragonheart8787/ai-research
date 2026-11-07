@@ -1,0 +1,61 @@
+# airos agent configuration. NO SECRETS HERE: credentials are environment variables referenced by NAME only (ADR-0011).
+# Everything real is DISABLED by default. Enabling anything is a deliberate human act and requires the attestations below.
+
+[security]
+# The system CANNOT verify provider-side settings. The human must set this to true, with the date, only after confirming on the provider
+# account page that "usage credits" (overflow billing at API rates) are OFF, so that the plan's Agent SDK credit is the hard cap.
+# Every Claude-driven adapter (planner, executor) refuses to start while this is false.
+usage_credits_attested_off = false
+attested_on = ""            # ISO date (YYYY-MM-DD) the human made the attestation
+
+[models]
+# Allowlists. Any other model id fails closed, including every Fable model. The Director's model is set by the human.
+planner = ["claude-opus-5-5"]
+executor = ["claude-sonnet-5-5"]
+director = []
+
+[roles.director]
+enabled = false
+auth_mode = "subscription_oauth"     # Codex with a ChatGPT login (read-only sandbox). Never an API key.
+model = ""                           # set by the human
+no_api_key_attested = false          # human: no billable API key was auto-created in the account
+login_volume = "airos-codex-director"  # dedicated volume, mounted ONLY into the Director container
+
+[roles.planner]
+enabled = false
+auth_mode = "subscription_oauth"
+model = "claude-opus-5-5"
+credential_env = "AIROS_CLAUDE_TOKEN_PLANNER"   # host variable NAME; injected into the planner container as CLAUDE_CODE_OAUTH_TOKEN only
+
+[roles.executor]
+enabled = false
+auth_mode = "subscription_oauth"
+model = "claude-sonnet-5-5"
+credential_env = "AIROS_CLAUDE_TOKEN_EXECUTOR"
+
+[roles.chatgpt_work]
+enabled = false
+auth_mode = "manual_handoff"
+repo_path = ""                       # LOCAL exchange repository (absolute path)
+allowed_authors = ""                 # comma-separated author e-mails; git author metadata is FORGEABLE (see ADR-0004)
+require_signature = false            # switch; default false. Unsigned results always need allowlisted author + human review
+
+[roles.ai_scientist]
+enabled = false                      # fail-closed stub until M5; this flag cannot enable it
+auth_mode = "subscription_oauth"
+
+[budget]
+# One ledger pool, "agent_sdk_credit". The plan credit is ASSUMED to be 20 USD (the human must verify); we plan with 15.
+agent_sdk_credit_monthly_cap_usd = 15
+unallocated_usd = 2                  # must equal cap - sum(allocations)
+
+[budget.allocations_usd]
+executor = 10
+planner = 3
+ai_scientist = 0
+
+[budget.director]
+max_runs_per_day = 0                 # the Director has no dollar pool; the human sets a run cap (0 = it cannot run)
+
+[quota_probe]
+enabled = false                      # optional read-only probe: never a gate, never used for budget decisions
