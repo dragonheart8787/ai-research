@@ -14,13 +14,13 @@ from airos.agents.real.claude_executor import (
 from airos.agents.real.common import AdapterProtocolError
 from airos.domain.schemas import ExpectedOutput, Role
 from airos.redaction import Redactor
-from tests.real_helpers import ANTHROPIC_EXEC_ENV, ENV, KEY_EXEC, ScriptedLoop, req
+from tests.real_helpers import ENV, EXECUTOR_ENV, TOKEN_EXECUTOR, ScriptedLoop, req
 
 OUT = [ExpectedOutput(logical_name="result.md", media_type="text/markdown", artifact_class="work_product")]
 
 
 def _adapter(loop, env=None, red=None):
-    return ClaudeAgentSdkExecutorAdapter(model="claude-test", credential_env=ANTHROPIC_EXEC_ENV, environ=ENV if env is None else env,
+    return ClaudeAgentSdkExecutorAdapter(model="claude-sonnet-5-5", credential_env=EXECUTOR_ENV, environ=ENV if env is None else env,
                                          redactor=red or Redactor(), loop=loop)
 
 
@@ -45,10 +45,10 @@ def test_the_loop_receives_exactly_the_contract_tools_and_a_contract_prompt(tmp_
     a = _adapter(loop)
     r = a.execute(req(Role.EXECUTOR, objective="OBJ-FROM-CONTRACT", allowed_actions=["fs.read", "fs.write.workspace"], outputs=OUT), tmp_path)
     [spec] = loop.specs
-    assert spec.allowed_tools == ("Edit", "Glob", "Grep", "Read", "Write") and spec.cwd == tmp_path and spec.model == "claude-test"
+    assert spec.allowed_tools == ("Edit", "Glob", "Grep", "Read", "Write") and spec.cwd == tmp_path and spec.model == "claude-sonnet-5-5"
     assert "OBJ-FROM-CONTRACT" in spec.prompt and spec.timeout_s > 0
     assert r.status == "succeeded" and not a.is_mock
-    assert (r.resource_usage.tokens_in, r.resource_usage.tokens_out, r.resource_usage.model, r.resource_usage.usd_micro) == (40, 9, "claude-test", 0)
+    assert (r.resource_usage.tokens_in, r.resource_usage.tokens_out, r.resource_usage.model, r.resource_usage.usd_micro) == (40, 9, "claude-sonnet-5-5", 0)
     [p] = r.produced_artifacts
     assert p.path == "out/result.md" and p.size_bytes == len(b"# result\n")
 
@@ -103,11 +103,11 @@ def test_oversized_output_and_early_stops_are_rejected(tmp_path):
 
 
 def test_secrets_in_text_output_are_redacted_before_hashing_and_binary_secrets_are_refused(tmp_path):
-    leaked = f"token {KEY_EXEC} end".encode()
+    leaked = f"token {TOKEN_EXECUTOR} end".encode()
     r = _adapter(ScriptedLoop(LoopResult("d", files=["out/result.md"]), writer=_writes(data=leaked))).execute(
         req(Role.EXECUTOR, allowed_actions=["fs.write.workspace"], outputs=OUT), tmp_path)
     stored = (tmp_path / "out" / "result.md").read_bytes()
-    assert KEY_EXEC.encode() not in stored and b"[REDACTED]" in stored
+    assert TOKEN_EXECUTOR.encode() not in stored and b"[REDACTED]" in stored
     import hashlib
 
     assert r.produced_artifacts[0].sha256 == hashlib.sha256(stored).hexdigest()       # the claim matches the REDACTED bytes
@@ -125,3 +125,19 @@ def test_missing_credentials_fail_closed_before_the_loop_runs(tmp_path):
     with pytest.raises(AdapterProtocolError) as e:
         _adapter(loop, env={}).execute(req(Role.EXECUTOR, outputs=OUT), tmp_path)
     assert e.value.category == "no_credentials" and loop.specs == []
+
+
+def test_a_host_or_unknown_loop_kind_is_refused_before_anything_runs(tmp_path):
+    for kind in ("host", "none", "in-process"):
+        loop = ScriptedLoop()
+        loop.kind = kind                                   # type: ignore[assignment]
+        with pytest.raises(AdapterProtocolError, match="must run inside the sandbox") as e:
+            _adapter(loop).execute(req(Role.EXECUTOR, outputs=OUT), tmp_path)
+        assert e.value.category == "policy" and loop.specs == []
+
+
+@pytest.mark.parametrize("src,expected", [("oauth", "subscription_oauth"), ("ANTHROPIC_API_KEY", "unconfirmed:ANTHROPIC_API_KEY"), (None, None)])
+def test_the_reported_credential_source_is_passed_through_for_the_billing_integrity_check(tmp_path, src, expected):
+    loop = ScriptedLoop(LoopResult("done", files=["out/result.md"], auth_source=src), writer=_writes())
+    r = _adapter(loop).execute(req(Role.EXECUTOR, allowed_actions=["fs.write.workspace"], outputs=OUT), tmp_path)
+    assert r.auth_path == expected

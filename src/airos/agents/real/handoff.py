@@ -20,6 +20,7 @@ from typing import Any, Literal
 from pydantic import ConfigDict, Field, ValidationError
 
 from airos.agents.real.common import AdapterProtocolError, InputReader, RealAdapterBase
+from airos.auth import AuthMode
 from airos.canonical import canonical_json
 from airos.domain.schemas import (
     AgentRequest,
@@ -171,10 +172,17 @@ class GitHandoff:
 
 
 class ChatGPTWorkHandoffAdapter(RealAdapterBase):
-    """role=chatgpt_work. Costs us nothing (priced as model 'handoff' = 0); the budget gate still applies."""
+    """role=chatgpt_work. Costs us nothing (priced as model 'handoff' = 0); the budget gate still applies. auth_mode=manual_handoff:
+    there is no provider login at all; the exchange is files in a git repository the control plane itself reads/writes."""
+
+    auth_mode = AuthMode.MANUAL_HANDOFF
+
+    @property
+    def runner_kind(self) -> str:
+        return "control_plane"   # git object reads by the control plane; no model, no agent code, nothing from the result is executed
 
     def __init__(self, *, git: GitHandoff, redactor: Redactor) -> None:
-        super().__init__(Role.CHATGPT_WORK, model="handoff", credential_env=None, environ={}, redactor=redactor, transport=None)
+        super().__init__(Role.CHATGPT_WORK, model="handoff", credential_env=None, environ={}, redactor=redactor, runner=None)
         self.git = git
         self.last_info: dict[str, Any] = {}
 
@@ -204,7 +212,8 @@ class ChatGPTWorkHandoffAdapter(RealAdapterBase):
         if info is None:
             self.last_info = {"state": "awaiting_external", "dispatched_now": dispatched, "request_sha256": req_sha}
             return AgentResponse(task_id=request.task_id, run_id=request.run_id, attempt=request.attempt, status="needs_input",
-                                 resource_usage=usage, notes="awaiting an external result; a human resumes the task when it arrives")
+                                 resource_usage=usage, notes="awaiting an external result; a human resumes the task when it arrives",
+                                 auth_path=AuthMode.MANUAL_HANDOFF.value)
         cfg = self.git.cfg
         if info.author_email not in cfg.allowed_authors:
             raise AdapterProtocolError("handoff_invalid", f"result commit {info.sha[:12]} author is not on the allowlist")
@@ -254,4 +263,4 @@ class ChatGPTWorkHandoffAdapter(RealAdapterBase):
         if missing:
             raise AdapterProtocolError("missing_artifact", f"result does not deliver expected outputs {sorted(missing)}")
         note = f"handoff commit {info.sha[:12]} by {info.author_email}; signature={info.signature}; human review mandatory"
-        return self._succeeded(request, produced, usage, notes=note)
+        return self._succeeded(request, produced, usage, notes=note, auth_path=AuthMode.MANUAL_HANDOFF.value)

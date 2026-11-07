@@ -22,6 +22,10 @@ _PATTERNS: tuple[re.Pattern[str], ...] = tuple(
         (r"eyJ[A-Za-z0-9_\-]{8,}\.eyJ[A-Za-z0-9_\-]{8,}\.[A-Za-z0-9_\-]{8,}", 0),
         (r"-----BEGIN [A-Z ]*PRIVATE KEY-----.*?-----END [A-Z ]*PRIVATE KEY-----", re.DOTALL),
         (r"bearer\s+[A-Za-z0-9._\-]{16,}", re.IGNORECASE),
+        # Codex (ChatGPT) login state, as it would appear in an auth.json dump or a log line (ADR-0011)
+        (r'\\?"(?:access_token|refresh_token|id_token|OPENAI_API_KEY|api_key)\\?"\s*:\s*\\?"[^"\\]{8,}\\?"', re.IGNORECASE),
+        # credential variables printed as NAME=value
+        (r"(?:CLAUDE_CODE_OAUTH_TOKEN|ANTHROPIC_API_KEY|ANTHROPIC_AUTH_TOKEN|OPENAI_API_KEY|CODEX_API_KEY|GEMINI_API_KEY)\s*=\s*\S{8,}", 0),
     )
 )
 

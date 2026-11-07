@@ -3,6 +3,7 @@ A secret planted in an adapter's response is redacted BEFORE storage (and the au
 from __future__ import annotations
 
 import hashlib
+import json
 from pathlib import Path
 
 import pytest
@@ -27,22 +28,22 @@ from airos.redaction import Redactor
 from tests.conftest import HUMAN, approve_fully, make_contract
 from tests.real_helpers import (
     ENV,
-    KEY_ANTHROPIC,
-    KEY_EXEC,
-    KEY_OPENAI,
+    TOKEN_EXECUTOR,
+    TOKEN_PLANNER,
     ScriptedLoop,
-    anthropic_fx,
+    claude_fx,
+    codex_exec_fx,
+    codex_status_fx,
     external_workflow,
     git,
-    grant_role_budget,
     make_bare_repo,
-    openai_fx,
     real_world,
     role_contract,
 )
 
-PLANTED = "planted-" + "secret-" + "Xk29Qm41Lp"        # a registered secret value (not one of the API keys)
-SECRETS = (KEY_OPENAI, KEY_ANTHROPIC, KEY_EXEC, PLANTED)
+PLANTED = "planted-" + "secret-" + "Xk29Qm41Lp"        # a registered secret value (not one of the tokens)
+CODEX_BLOB = '{"tokens": {"access_token": "' + "eyJ" + "x" * 12 + '", "refresh_token": "rt_' + "Zz9" * 8 + '"}}'   # a fake Codex auth.json dump
+SECRETS = (TOKEN_PLANNER, TOKEN_EXECUTOR, PLANTED)
 
 
 def _all_bytes(*roots: Path) -> bytes:
@@ -59,23 +60,24 @@ def _db_files(db_path):
 
 
 def test_planted_secrets_in_every_real_adapter_response_never_reach_disk_cas_audit_or_db(open_repo, tmp_path, db_path):
-    repo = open_repo(redactor=Redactor([PLANTED]))
+    from airos.domain.limits import Limits
+
+    repo = open_repo(redactor=Redactor([PLANTED]), limits=Limits(director_max_runs_per_day=10))
     bare = make_bare_repo(tmp_path / "xchg")
-    leak = f"{PLANTED} / {KEY_OPENAI} / {KEY_ANTHROPIC} / {KEY_EXEC}"
-    fixtures = {"openai": [openai_fx(content=f"director says {leak}", usage=(5, 5))],
-                "anthropic": [anthropic_fx(text=f"planner says {leak}", usage=(5, 5))]}
+    leak = f"{PLANTED} / {TOKEN_PLANNER} / {TOKEN_EXECUTOR} / {CODEX_BLOB}"
+    plan = json.dumps({"schema_version": "plan-proposal/1", "tasks": [{"title": "t", "objective": f"planner says {leak}", "role": "executor"}]})
+    fixtures = [codex_status_fx(), codex_exec_fx(f"director says {leak}", usage=(5, 5)), claude_fx(plan, usage=(5, 5))]
 
     def writer(spec):
         (spec.cwd / "out").mkdir(exist_ok=True)
         (spec.cwd / "out" / "result.md").write_text(f"executor says {leak}")
 
-    loop = ScriptedLoop(LoopResult("done", files=["out/result.md"], tokens_in=5, tokens_out=5), writer=writer)
+    loop = ScriptedLoop(LoopResult("done", files=["out/result.md"], tokens_in=5, tokens_out=5, auth_source="oauth"), writer=writer)
     cfg = HandoffConfig(repo_path=bare, allowed_authors=frozenset({"chatgpt-work@example.invalid"}), work_root=tmp_path / "cp")
     w = real_world(repo, tmp_path / "w", fixtures=fixtures, handoff=cfg, loop=loop)
     tasks = {}
     for role in ("director", "planner", "executor", "chatgpt_work"):
         tasks[role] = approve_fully(repo, repo.create_task(role_contract(role), HUMAN).task)
-        grant_role_budget(repo, tasks[role], role)
     w.worker.tick()                                                                    # director/planner/executor run; handoff parks
     parked = repo.get_task(tasks["chatgpt_work"].task_id)
     req_sha = hashlib.sha256(git("show", f"main:requests/{parked.task_id}/request.json", cwd=bare).encode()).hexdigest()
@@ -85,59 +87,55 @@ def test_planted_secrets_in_every_real_adapter_response_never_reach_disk_cas_aud
     assert {r: repo.get_task(t.task_id).state for r, t in tasks.items()} == {r: TaskState.REVIEW for r in tasks}
     arts = repo.list_artifacts()
     assert len(arts) == 4
-    # (1) stored artifact bytes
+    markers = (*SECRETS, "rt_" + "Zz9" * 8, "eyJ" + "x" * 12)
     for a in arts:
         data = w.svc.store.path_for(a.sha256).read_bytes()
-        assert not any(s.encode() in data for s in SECRETS), a.logical_name
+        assert not any(s.encode() in data for s in markers), a.logical_name
         assert b"[REDACTED]" in data
         assert w.svc.verify(a.artifact_id).ok                                          # registry hash == hash of the REDACTED bytes
-    # (2) the content-addressed store as a whole, (3) the audit log, (4) every database byte, (5) what WE sent out (the exchange repo requests/ side; the external side wrote its own leak by design)
-    assert not any(s.encode() in _all_bytes(tmp_path / "w" / "cas") for s in SECRETS)
-    assert not any(s in e.model_dump_json() for e in repo.iter_events() for s in SECRETS)
+    assert not any(s.encode() in _all_bytes(tmp_path / "w" / "cas") for s in markers)
+    assert not any(s in e.model_dump_json() for e in repo.iter_events() for s in markers)
     assert repo.verify_chain().ok
     repo.close()
-    assert not any(s.encode() in _all_bytes(*_db_files(db_path)) for s in SECRETS)
-    assert not any(s in git("log", "-p", "--all", "--", "requests", cwd=bare) for s in (KEY_OPENAI, KEY_ANTHROPIC, KEY_EXEC))
+    assert not any(s.encode() in _all_bytes(*_db_files(db_path)) for s in markers)
+    # what WE sent out to the exchange repo (the external side wrote its own leak by design)
+    assert not any(s in git("log", "-p", "--all", "--", "requests", cwd=bare) for s in (TOKEN_PLANNER, TOKEN_EXECUTOR))
 
 
-def test_credentials_come_only_from_the_environment_and_are_not_in_any_object_state(open_repo, tmp_path):
-    repo = open_repo()
-    w = real_world(repo, tmp_path, fixtures={"openai": [openai_fx(usage=(1, 1))], "anthropic": [anthropic_fx(usage=(1, 1))]},
+def test_credentials_come_only_from_the_environment_and_are_not_in_any_object_state(real_repo, tmp_path):
+    repo = real_repo
+    w = real_world(repo, tmp_path, fixtures=[codex_status_fx(), codex_exec_fx(usage=(1, 1)), claude_fx(usage=(1, 1))],
                    roles=("director", "planner"))
     for role in ("director", "planner"):
-        t = approve_fully(repo, repo.create_task(role_contract(role), HUMAN).task)
-        grant_role_budget(repo, t, role)
+        approve_fully(repo, repo.create_task(role_contract(role), HUMAN).task)
     w.worker.tick()
-    for role, key in (("director", KEY_OPENAI), ("planner", KEY_ANTHROPIC)):
-        adapter = w.registry.resolve(role)
-        assert all(key not in repr(v) for k, v in vars(adapter).items() if k != "transport")
-        assert not any(key == v for v in vars(adapter).values())                         # not held as an attribute at all
+    adapter = w.registry.resolve("planner")
+    assert all(TOKEN_PLANNER not in repr(v) for k, v in vars(adapter).items() if k not in ("runner",))
+    assert not any(v == TOKEN_PLANNER for v in vars(adapter).values())                    # not held as an attribute at all
     for spec in w.registry._specs.values():
-        assert all(key not in repr(spec) for key in ENV.values())                         # specs carry env var NAMES only
-    # after use the keys are registered with the shared redactor, so even an accidental print is masked
-    assert KEY_OPENAI not in repo.redactor.redact_text(f"oops {KEY_OPENAI}") and repr(repo.redactor).startswith("Redactor(<")
+        assert all(tok not in repr(spec) for tok in ENV.values())                         # specs carry env var NAMES only
+    # after use the token is registered with the shared redactor, so even an accidental print is masked
+    assert TOKEN_PLANNER not in repo.redactor.redact_text(f"oops {TOKEN_PLANNER}") and repr(repo.redactor).startswith("Redactor(<")
 
 
-def test_a_transport_error_message_containing_the_key_is_redacted_in_every_record(open_repo, tmp_path):
-    repo = open_repo()
-    from airos.agents.real.transport import TransportError
-
-    class Leaky:
-        def send(self, request):
-            raise TransportError(f"TLS failure talking with Authorization: Bearer {KEY_OPENAI}")
-
-    w = real_world(repo, tmp_path, roles=("director",))
-    w.registry._factories[Role.DIRECTOR] = type(w.registry._factories[Role.DIRECTOR])(True, True, lambda spec, env, red: __import__(
-        "airos.agents.real.llm_adapters", fromlist=["OpenAIDirectorAdapter"]).OpenAIDirectorAdapter(
-            model="gpt-test", credential_env=spec.credential_env, environ=env, redactor=red, transport=Leaky()))
-    w.registry._built.clear()
-    t = approve_fully(repo, repo.create_task(role_contract("director"), HUMAN).task)
-    grant_role_budget(repo, t, "director")
+def test_a_cli_failure_whose_text_contains_the_token_is_redacted_in_every_record(real_repo, tmp_path):
+    repo = real_repo
+    leaky = claude_fx("boom", returncode=1, is_error=True, usage=None, stderr=f"auth failure with CLAUDE_CODE_OAUTH_TOKEN={TOKEN_PLANNER}")
+    w = real_world(repo, tmp_path, fixtures=[leaky], roles=("planner",))
+    t = approve_fully(repo, repo.create_task(role_contract("planner"), HUMAN).task)
     w.worker.tick()
     cur = repo.get_task(t.task_id)
-    assert cur.state is TaskState.QUEUED and cur.error_history[-1].retryable                  # transient transport failure -> retry
+    assert cur.state is TaskState.QUEUED and cur.error_history[-1].retryable                  # transient failure -> retry
     blob = repr(cur.error_history) + "".join(e.model_dump_json() for e in repo.iter_events())
-    assert KEY_OPENAI not in blob and "[REDACTED]" in blob
+    assert TOKEN_PLANNER not in blob
+
+
+def test_login_state_patterns_are_redacted_without_registration():
+    red = Redactor()
+    for text in (CODEX_BLOB, "CLAUDE_CODE_OAUTH_TOKEN=abcdefgh12345678", "OPENAI_API_KEY = zzzzzzzzzz", "token sk-ant-" + "oat01-" + "Q" * 24):
+        out = red.redact_text(text)
+        assert out != text and "[REDACTED]" in out
+    assert "Zz9Zz9Zz9" not in red.redact_text(CODEX_BLOB)
 
 
 # ------------------------------------------------------------------ the generic ingest path (any adapter, including mocks)

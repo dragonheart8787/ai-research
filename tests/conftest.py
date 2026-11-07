@@ -31,12 +31,17 @@ CGW = Actor(ActorKind.CHATGPT_WORK, "chatgpt_work-1")
 SCI = Actor(ActorKind.AI_SCIENTIST, "ai_scientist-1")
 AGENT_ACTORS = (PLANNER, DIRECTOR, EXECUTOR, CGW, SCI)
 
-# Test price table: "unit-model" costs exactly 1 micro-USD per token (in and out), so tests can pick USD by picking tokens.
+# Test price table (schema v2: every entry needs model_id, source_url, retrieved_at). Prices are SYNTHETIC: 1 micro-USD per token
+# in and out, so tests can pick USD by picking tokens. They are not real API rates.
+def _tp(model: str, price: int = 1_000_000) -> dict[str, object]:
+    return {"model_id": model, "input": price, "output": price, "source_url": "test:synthetic-not-a-real-price", "retrieved_at": "2026-11-07"}
+
+
 TEST_PRICES = PriceTable.from_dict({
-    "schema": "airos-prices/1", "version": "test-v1", "currency": "USD", "unit": "usd_micro_per_million_tokens",
-    "models": {"mock": {"input": 0, "output": 0}, "unit-model": {"input": 1_000_000, "output": 1_000_000},
-               "gpt-test": {"input": 1_000_000, "output": 1_000_000}, "claude-test": {"input": 1_000_000, "output": 1_000_000},
-               "handoff": {"input": 0, "output": 0}}})
+    "schema": "airos-prices/2", "version": "test-v2", "currency": "USD", "unit": "usd_micro_per_million_tokens",
+    "models": {"mock": _tp("mock", 0), "handoff": _tp("handoff", 0), "unit-model": _tp("unit-model"),
+               "claude-opus-5-5": _tp("claude-opus-5-5"), "claude-sonnet-5-5": _tp("claude-sonnet-5-5"),
+               "director-test-model": _tp("director-test-model")}})
 
 _counter = itertools.count(1)
 
@@ -138,3 +143,11 @@ def to_running(repo: SqliteRepository, task: TaskRecord, worker: str = "w1") -> 
     t = repo.queue_task(t.task_id, t.version)
     run = repo.start_run(t.task_id, worker, EXECUTOR.id, t.version)
     return repo.get_task(t.task_id), run.run_id
+
+
+@pytest.fixture
+def real_repo(open_repo: Callable[..., SqliteRepository]) -> SqliteRepository:
+    """Repository whose human-set Director run cap allows runs (the default is 0 = the Director cannot run)."""
+    from airos.domain.limits import Limits
+
+    return open_repo(limits=Limits(director_max_runs_per_day=100))

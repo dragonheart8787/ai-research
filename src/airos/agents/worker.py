@@ -5,17 +5,20 @@ Everything that changes state goes through the repository (guards, ledger, audit
 from __future__ import annotations
 
 import contextlib
+import os
 import threading
 import time
 import uuid
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 
 from pydantic import ValidationError
 
-from airos.agents.real.common import AdapterProtocolError
+from airos.agents.real.common import ISOLATED_RUNNER_KINDS, AdapterProtocolError
 from airos.agents.registry import AgentRegistry
 from airos.agents.runner import Runner
 from airos.artifacts import ArtifactService
+from airos.auth import scan_host_environment
 from airos.domain.guards import GuardContext
 from airos.domain.schemas import (
     AgentResponse,
@@ -59,8 +62,9 @@ class TickReport:
 
 class Worker:
     def __init__(self, repo: SqliteRepository, registry: AgentRegistry, runner: Runner, artifacts: ArtifactService,
-                 worker_id: str) -> None:
+                 worker_id: str, host_environ: Mapping[str, str] | None = None) -> None:
         self.repo, self.registry, self.runner, self.artifacts, self.worker_id = repo, registry, runner, artifacts, worker_id
+        self._host_environ = os.environ if host_environ is None else host_environ
         repo.set_real_roles(registry.real_roles())
         # The side-effect rule for workspace_write tasks depends on a PROVEN property of the runner, not a declared one.
         repo.set_runner_guarantee(self.prove_fresh_run_dirs(runner))
@@ -85,7 +89,12 @@ class Worker:
             return False
 
     def start(self) -> RecoveryReport:
-        """Startup: recover every run owned by a dead process (deterministic, run_seq order)."""
+        """Startup: recover every run owned by a dead process (deterministic, run_seq order). Also reports (names only) any forbidden
+        billing variables present in the host environment: they are IGNORED, never inherited by an adapter."""
+        present = scan_host_environment(self._host_environ)
+        if present:
+            with contextlib.suppress(AirosError):
+                self.repo.record_system_event("env.forbidden_present_on_host", {"names": present, "action": "ignored; never passed to adapters"})
         return self.repo.recover_leases(self.worker_id)
 
     def sweep_timeouts(self) -> list[str]:
@@ -220,6 +229,10 @@ class Worker:
         if not self.repo.heartbeat(run_id, self.worker_id):
             return
         agent = Actor(ActorKind(task.assigned_role.value), f"{task.assigned_role.value}-1")
+        kind = getattr(adapter, "runner_kind", "none")
+        if not adapter.is_mock and kind not in (*ISOLATED_RUNNER_KINDS, "control_plane"):
+            self._reject(task, run_id, "policy", f"real adapter refused: runner kind {kind!r} is not sandboxed (no in-process / host execution)", None, adapter)
+            return
 
         def read_input(artifact_id: str) -> bytes:  # the adapter can read ONLY what this agent role may read (pinned inputs)
             return self.artifacts.read(agent, artifact_id, for_task_id=task.task_id)
@@ -264,6 +277,15 @@ class Worker:
             with contextlib.suppress(LeaseLost):
                 self.repo.park_run(run_id, self.worker_id, response.notes or "needs external input", usage=usage)
             return
+        if response.status == "failed" and response.error is not None and response.error.error_class == "credit_exhausted":
+            # The plan credit is used up (or the provider stopped requests): block for a human, never auto-retry, and this
+            # attempt does NOT count toward the retry limit.
+            self._audit("adapter.response_rejected", task, {"role": task.assigned_role.value, "category": "credit_exhausted",
+                                                            "detail": response.error.detail[:500], "mock": adapter.is_mock, "run_id": run_id})
+            with contextlib.suppress(LeaseLost):
+                self.repo.park_run(run_id, self.worker_id, "credit exhausted", usage=usage, block_reason=BlockReason.CREDIT_EXHAUSTED,
+                                   uncount_attempt=True)
+            return
         if response.status != "succeeded":
             self._fail(run_id, retryable=response.retryable, error_class=(response.error.error_class if response.error else "adapter_error"),
                        detail=(response.error.detail if response.error else f"status {response.status}"), usage=usage)
@@ -294,3 +316,9 @@ class Worker:
             return
         with contextlib.suppress(LeaseLost):
             self.repo.complete_run(run_id, self.worker_id, RunState.SUCCEEDED, verifier_passed=True, usage=usage)
+            expected = getattr(adapter, "auth_mode", None)
+            if not adapter.is_mock and expected is not None and response.auth_path != expected.value:
+                # billing-integrity check (ADR-0011): the reported auth path must be the expected subscription path; otherwise hold for a human
+                self.repo.hold_for_human_review(task.task_id, "billing.integrity_mismatch", {
+                    "role": task.assigned_role.value, "expected_auth_path": expected.value, "reported_auth_path": response.auth_path,
+                    "run_id": run_id})

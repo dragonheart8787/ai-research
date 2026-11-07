@@ -1,17 +1,16 @@
-"""Shared plumbing for real adapters: credentials from the environment only, host allowlist, untrusted-input prompt
-rendering, bounded output writing with secret redaction, and the fail-closed protocol error."""
+"""Shared plumbing for real adapters (subscription auth only; ADR-0011): credentials from the environment by NAME, untrusted-input
+prompt rendering, bounded output writing with secret redaction, the isolation gate, and the fail-closed protocol error."""
 from __future__ import annotations
 
 import hashlib
-import json
+import re
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
-from urllib.parse import urlsplit
 
-from airos.agents.real.transport import HttpRequest, HttpResponse, Transport, TransportError
+from airos.agents.real.cli import CliRunner
+from airos.auth import AuthMode, validate_credential_host_var
 from airos.domain.schemas import (
+    AcceptanceResult,
     AgentRequest,
     AgentResponse,
     ArtifactClass,
@@ -23,17 +22,22 @@ from airos.domain.schemas import (
 from airos.errors import AirosError
 from airos.redaction import Redactor
 
-MAX_HTTP_BODY_BYTES = 1 * 1024 * 1024      # a model response larger than this is rejected, never parsed
 MAX_OUTPUT_BYTES = 1 * 1024 * 1024         # default cap for one produced text output
 MAX_INPUT_BYTES_IN_PROMPT = 64 * 1024      # each input artifact is truncated to this many bytes in a prompt
 
 InputReader = Callable[[str], bytes]       # artifact_id -> bytes (the worker binds it to the agent's read permissions)
 
+# Runner kinds a real adapter may use. "host" (an in-process / host subprocess) is NEVER accepted.
+ISOLATED_RUNNER_KINDS = frozenset({"fixture", "container"})
+SUBSCRIPTION_CREDIT_PATTERNS = (  # ASSUMPTION, unverified against the real CLIs (the M4b live check records real wording)
+    re.compile(r"usage limit", re.I), re.compile(r"credit", re.I), re.compile(r"quota", re.I), re.compile(r"limit (reached|exceeded)", re.I),
+)
+
 
 class AdapterProtocolError(AirosError):
     """The adapter's counterpart violated the contract. Always fail closed; the worker audits it.
 
-    category: malformed | oversized | missing_artifact | truncated | policy | no_credentials | handoff_invalid
+    category: malformed | oversized | missing_artifact | truncated | policy | no_credentials | handoff_invalid | billing
     """
 
     def __init__(self, category: str, detail: str, *, retryable: bool = False) -> None:
@@ -41,60 +45,38 @@ class AdapterProtocolError(AirosError):
         self.category, self.detail, self.retryable = category, detail, retryable
 
 
-@dataclass(frozen=True)
-class CallResult:
-    data: dict[str, Any]
-    response: HttpResponse
+def looks_like_credit_exhaustion(text: str) -> bool:
+    return any(p.search(text) for p in SUBSCRIPTION_CREDIT_PATTERNS)
 
 
 class RealAdapterBase:
     is_mock = False
+    auth_mode: AuthMode = AuthMode.SUBSCRIPTION_OAUTH
 
     def __init__(self, role: Role, *, model: str | None, credential_env: str | None, environ: Mapping[str, str],
-                 redactor: Redactor, transport: Transport | None, allowed_hosts: frozenset[str] = frozenset()) -> None:
+                 redactor: Redactor, runner: CliRunner | None) -> None:
+        validate_credential_host_var(credential_env)
         self.role, self.model, self.credential_env = role, model, credential_env
-        self._env_get, self.redactor, self.transport, self._hosts = environ.get, redactor, transport, allowed_hosts  # no copy of the env is kept
+        self._env_get, self.redactor, self.runner = environ.get, redactor, runner  # no copy of the host env is kept
 
-    # -------------------------------------------------------------- credentials: environment variables ONLY
+    @property
+    def runner_kind(self) -> str:
+        return self.runner.kind if self.runner is not None else "none"
+
+    def _require_isolated_runner(self) -> CliRunner:
+        """Real adapters never run in-process or on the host: only behind a fixture replay or the sandbox container runner."""
+        if self.runner is None or self.runner.kind not in ISOLATED_RUNNER_KINDS:
+            raise AdapterProtocolError("policy", f"real adapter {self.role.value!r} refuses to run with runner kind {self.runner_kind!r}: "
+                                                 "it must run inside the sandbox")
+        return self.runner
+
+    # -------------------------------------------------------------- credentials: environment variables ONLY (by name)
     def _credential(self) -> str:
         value = self._env_get(self.credential_env or "", "")
         if not value:
             raise AdapterProtocolError("no_credentials", f"environment variable {self.credential_env!r} is not set")
         self.redactor.register_secret(value)  # from now on it is masked in every log, event and stored artifact
         return value
-
-    # -------------------------------------------------------------- HTTP with host allowlist + size cap
-    def _post_json(self, url: str, headers: Mapping[str, str], payload: dict[str, Any], timeout_s: float) -> CallResult:
-        parts = urlsplit(url)
-        if parts.scheme != "https" or parts.hostname not in self._hosts:
-            raise AdapterProtocolError("policy", f"host {parts.hostname!r} is not allowlisted for this adapter")
-        if self.transport is None:
-            raise AdapterProtocolError("policy", "no transport configured")
-        body = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
-        resp = self.transport.send(HttpRequest("POST", url, headers, body, timeout_s))
-        if len(resp.body) > MAX_HTTP_BODY_BYTES:
-            raise AdapterProtocolError("oversized", f"response body is {len(resp.body)} bytes (limit {MAX_HTTP_BODY_BYTES})")
-        try:
-            data = json.loads(resp.body.decode("utf-8")) if resp.body else {}
-        except ValueError as exc:
-            if 200 <= resp.status < 300:
-                raise AdapterProtocolError("malformed", "response is not valid JSON") from exc
-            data = {}
-        if not isinstance(data, dict):
-            raise AdapterProtocolError("malformed", "response JSON is not an object")
-        return CallResult(data, resp)
-
-    def _http_failure(self, request: AgentRequest, res: CallResult, usage: ResourceUsage) -> AgentResponse | None:
-        """Map a non-2xx status to a failed AgentResponse (retry policy by status); None if the call succeeded."""
-        s = res.response.status
-        if 200 <= s < 300:
-            return None
-        transient = s in (408, 409, 425, 429) or s >= 500
-        msg = f"HTTP {s}"
-        err = ErrorRecord(ts_ms=0, attempt=request.attempt, error_class="transient" if transient else "adapter_error",
-                          retryable=transient, detail=self.redactor.redact_text(msg))
-        return AgentResponse(task_id=request.task_id, run_id=request.run_id, attempt=request.attempt, status="failed",
-                             retryable=transient, resource_usage=usage, error=err)
 
     # -------------------------------------------------------------- prompts: inputs are DATA, never instructions
     def _render_prompt(self, request: AgentRequest, inputs: InputReader | None) -> str:
@@ -132,48 +114,20 @@ class RealAdapterBase:
                                  parent_artifact_ids=parents if parents is not None else [a.artifact_id for a in request.input_artifacts])]
 
     def _usage(self, tokens_in: int, tokens_out: int) -> ResourceUsage:
-        # usd_micro is deliberately 0: the control plane prices tokens itself (airos.pricing); this field is ignored.
+        # usd_micro is deliberately 0: the control plane ESTIMATES consumption from tokens x the pinned price table; this is ignored.
         return ResourceUsage(tokens_in=tokens_in, tokens_out=tokens_out, usd_micro=0, wall_ms=0, measured_by="adapter", model=self.model)
 
-    def _succeeded(self, request: AgentRequest, produced: list[ProducedArtifact], usage: ResourceUsage, notes: str = "") -> AgentResponse:
-        from airos.domain.schemas import AcceptanceResult
-
+    def _succeeded(self, request: AgentRequest, produced: list[ProducedArtifact], usage: ResourceUsage, notes: str = "",
+                   auth_path: str | None = None) -> AgentResponse:
         return AgentResponse(
             task_id=request.task_id, run_id=request.run_id, attempt=request.attempt, status="succeeded", resource_usage=usage,
             produced_artifacts=produced,
             acceptance_results=[AcceptanceResult(criterion_id=c.id, self_reported="not_applicable") for c in request.acceptance_criteria],
-            notes=self.redactor.redact_text(notes)[:2000])
+            notes=self.redactor.redact_text(notes)[:2000], auth_path=auth_path)
 
-    def _failed(self, request: AgentRequest, usage: ResourceUsage, cls: str, detail: str, retryable: bool) -> AgentResponse:
+    def _failed(self, request: AgentRequest, usage: ResourceUsage, cls: str, detail: str, retryable: bool,
+                auth_path: str | None = None) -> AgentResponse:
         err = ErrorRecord(ts_ms=0, attempt=request.attempt, error_class=cls, retryable=retryable,
                           detail=self.redactor.redact_text(detail)[:1000])
         return AgentResponse(task_id=request.task_id, run_id=request.run_id, attempt=request.attempt, status="failed",
-                             retryable=retryable, resource_usage=usage, error=err)
-
-
-def expect_str(obj: Any, *path: str | int) -> str:
-    """Walk a parsed JSON value; anything missing or of the wrong type is a MALFORMED response (fail closed)."""
-    cur = obj
-    for key in path:
-        try:
-            cur = cur[key]
-        except (KeyError, IndexError, TypeError) as exc:
-            raise AdapterProtocolError("malformed", f"missing field {'.'.join(map(str, path))}") from exc
-    if not isinstance(cur, str):
-        raise AdapterProtocolError("malformed", f"field {'.'.join(map(str, path))} is not a string")
-    return cur
-
-
-def expect_int(obj: Any, *path: str) -> int:
-    cur = obj
-    for key in path:
-        try:
-            cur = cur[key]
-        except (KeyError, TypeError) as exc:
-            raise AdapterProtocolError("malformed", f"missing field {'.'.join(path)}") from exc
-    if isinstance(cur, bool) or not isinstance(cur, int) or cur < 0:
-        raise AdapterProtocolError("malformed", f"field {'.'.join(path)} is not a non-negative integer")
-    return cur
-
-
-__all__ = ["AdapterProtocolError", "InputReader", "RealAdapterBase", "TransportError", "expect_int", "expect_str"]
+                             retryable=retryable, resource_usage=usage, error=err, auth_path=auth_path)

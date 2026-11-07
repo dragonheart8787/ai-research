@@ -1,6 +1,6 @@
 """Claude Agent SDK Executor adapter, written against an `AgentLoop` interface.
 
-The SDK itself, the container it must run in, and the egress policy are M4. Nothing here imports the SDK. The adapter's
+The SDK itself, the container it must run in, and the egress policy are M4 (the sandbox loop is verified on the VM in M4b). Nothing here imports the SDK. The adapter's
 security-relevant job is the one it CAN do offline: the tool set is derived ONLY from the approved contract's
 `allowed_actions` through a static table, and the loop's reported tool calls are re-checked against it (fail closed).
 """
@@ -10,9 +10,10 @@ import hashlib
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Protocol
+from typing import Literal, Protocol
 
-from airos.agents.real.common import AdapterProtocolError, InputReader, RealAdapterBase
+from airos.agents.real.cli_adapters import extract_claude_auth
+from airos.agents.real.common import ISOLATED_RUNNER_KINDS, AdapterProtocolError, InputReader, RealAdapterBase
 from airos.artifacts import safe_resolve_in
 from airos.domain.schemas import AgentRequest, AgentResponse, ArtifactClass, ProducedArtifact, Role
 from airos.errors import UnsafePath
@@ -56,9 +57,12 @@ class LoopResult:
     tokens_in: int = 0
     tokens_out: int = 0
     stop_reason: str = "end_turn"
+    auth_source: str | None = None   # what the SDK reports as its credential source (billing-integrity check)
 
 
 class AgentLoop(Protocol):
+    kind: Literal["fixture", "container", "host"]   # where the loop really runs; "host"/in-process is refused
+
     def run(self, spec: LoopSpec) -> LoopResult: ...
 
 
@@ -68,11 +72,17 @@ EXECUTOR_SYSTEM = ("You are the Executor. Work only inside the current directory
 
 class ClaudeAgentSdkExecutorAdapter(RealAdapterBase):
     def __init__(self, *, model: str, credential_env: str, environ: Mapping[str, str], redactor: Redactor, loop: AgentLoop) -> None:
-        super().__init__(Role.EXECUTOR, model=model, credential_env=credential_env, environ=environ, redactor=redactor, transport=None)
+        super().__init__(Role.EXECUTOR, model=model, credential_env=credential_env, environ=environ, redactor=redactor, runner=None)
         self.loop = loop
 
+    @property
+    def runner_kind(self) -> str:
+        return str(getattr(self.loop, "kind", "none"))
+
     def execute(self, request: AgentRequest, workdir: Path, inputs: InputReader | None = None) -> AgentResponse:
-        self._credential()  # presence check + registers the secret with the redactor; the loop/SDK reads it from the env itself
+        if self.runner_kind not in ISOLATED_RUNNER_KINDS:  # never in-process / on the host
+            raise AdapterProtocolError("policy", f"real adapter 'executor' refuses to run with loop kind {self.runner_kind!r}: it must run inside the sandbox")
+        self._credential()  # presence check + registers the secret; the sandbox loop receives it as CLAUDE_CODE_OAUTH_TOKEN in ITS OWN env only
         spec = LoopSpec(model=self.model or "", system=EXECUTOR_SYSTEM, prompt=self._render_prompt(request, inputs),
                         allowed_tools=tools_for(request.allowed_actions),  # <- contract only, never artifact text or model output
                         cwd=workdir, max_turns=20, timeout_s=request.resource_limits.wall_clock_s)
@@ -105,4 +115,5 @@ class ClaudeAgentSdkExecutorAdapter(RealAdapterBase):
             produced.append(ProducedArtifact(
                 logical_name=name, path=rel, sha256=hashlib.sha256(data).hexdigest(), size_bytes=len(data), media_type=eo.media_type,
                 artifact_class=ArtifactClass.WORK_PRODUCT, parent_artifact_ids=[a.artifact_id for a in request.input_artifacts]))
-        return self._succeeded(request, produced, usage, notes=result.final_text)
+        auth = extract_claude_auth({"apiKeySource": result.auth_source}) if result.auth_source is not None else None
+        return self._succeeded(request, produced, usage, notes=result.final_text, auth_path=auth)

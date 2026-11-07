@@ -32,6 +32,8 @@ USAGE = ResourceUsage(tokens_in=0, tokens_out=0, usd_micro=0, wall_ms=1, measure
 class Scripted(MockAdapter):
     """An adapter whose behaviour is a function (request, workdir) -> anything; `is_mock` selectable."""
 
+    runner_kind = "fixture"   # a non-mock adapter must declare a sandboxed runner kind to pass the worker's isolation gate
+
     def __init__(self, fn, is_mock=True):
         super().__init__(Role.EXECUTOR)
         self._fn = fn
