@@ -1,0 +1,50 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "airos"
+version = "0.1.0"
+description = "Autonomous AI Research OS - control plane (M1: domain + persistence)"
+requires-python = ">=3.11"
+dependencies = ["pydantic>=2.6,<3"]
+
+[project.optional-dependencies]
+dev = ["pytest", "hypothesis", "ruff", "mypy", "httpx"]
+api = ["fastapi", "uvicorn"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+airos = ["persistence/migrations/*.sql", "security/permissions.json", "pricing_data/*.json"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+addopts = "-ra -p no:cacheprovider"
+# Every warning is an error EXCEPT one exact, known message (Starlette 1.x deprecating httpx in TestClient; the
+# replacement package is not installed). Any other warning still fails the suite.
+filterwarnings = [
+    "error",
+    "ignore:Using .httpx. with .starlette.testclient. is deprecated:Warning",
+]
+markers = [
+    "spec_only: checks a container run spec only; isolation NOT verified",
+    "docker_real: needs a real Docker daemon and AIROS_TEST_DOCKER=1; SKIPPED everywhere else (written in M4a, never executed there)",
+]
+
+[tool.ruff]
+target-version = "py311"
+line-length = 110
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP", "SIM"]
+ignore = ["E501", "UP042"]
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
+mypy_path = "src"
+plugins = ["pydantic.mypy"]

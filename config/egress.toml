@@ -1,0 +1,26 @@
+# Egress allow-list as DATA (PROPOSAL 11.1, ADR-0005/0006). Default DENY. No secrets here.
+# Enforcement is by a per-role allow-list proxy on a per-role internal network; that proxy is NOT built or tested in this milestone (M4b, needs the VM).
+# Rules enforced when this file is loaded: exact lower-case DNS names only (no wildcards, no IP literals, no URLs), ports from [policy].ports,
+# at most 4 hosts per role. A role that is absent, or has an empty list, can reach nothing.
+#
+# !! The host names below are ASSUMPTIONS written from memory of how the CLIs authenticate. They are UNVERIFIED. The M4b live check
+# !! (docs/architecture/M4B-HANDOFF.md) is where the real set is observed; adjust this file only on a human decision, with an audit note.
+
+[policy]
+default = "deny"
+ports = [443]
+
+[roles.planner]
+hosts = ["api.anthropic.com"]                 # ASSUMED (Claude Code, subscription OAuth)
+
+[roles.executor]
+hosts = ["api.anthropic.com"]                 # ASSUMED
+
+[roles.director]
+hosts = ["chatgpt.com", "auth.openai.com"]    # ASSUMED (Codex CLI with a ChatGPT login)
+
+[roles.chatgpt_work]
+hosts = []                                    # manual handoff: no container, no egress
+
+[roles.ai_scientist]
+hosts = []                                    # fail-closed stub until M5; M5 adds exactly ONE provider host here

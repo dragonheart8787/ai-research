@@ -1,0 +1,69 @@
+{
+  "format": "airos-audit-chain/1",
+  "genesis": "0000000000000000000000000000000000000000000000000000000000000000",
+  "rule": "entry_hash = sha256(prev_hash + '\\n' + canonical_json(material)); material = event fields except prev_hash/entry_hash, payload as object",
+  "events": [
+    {
+      "seq": 1,
+      "event_id": "e1",
+      "ts_ms": 1700000000000,
+      "task_id": "t1",
+      "run_id": null,
+      "event_type": "task.created",
+      "actor_id": "human-1",
+      "actor_kind": "human",
+      "from_state": null,
+      "to_state": "draft",
+      "payload": {
+        "contract_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "depth": 0
+      },
+      "expected_entry_hash": "1f6480499d4fe33a59ae88c1891383b0eb1c61dedfa3163a03b69e26b7c41eba"
+    },
+    {
+      "seq": 2,
+      "event_id": "e2",
+      "ts_ms": 1700000001000,
+      "task_id": "t1",
+      "run_id": null,
+      "event_type": "task.transition",
+      "actor_id": "planner-1",
+      "actor_kind": "planner",
+      "from_state": "draft",
+      "to_state": "planned",
+      "payload": {
+        "event": "plan",
+        "reason": "ünïcode ✓",
+        "version": 2
+      },
+      "expected_entry_hash": "148f8dcc2dc4465d235e5739c2dc4a52610865205ae9f9bf0901d367995709a0"
+    },
+    {
+      "seq": 3,
+      "event_id": "e3",
+      "ts_ms": 1700000002000,
+      "task_id": null,
+      "run_id": null,
+      "event_type": "recovery.completed",
+      "actor_id": "system",
+      "actor_kind": "system",
+      "from_state": null,
+      "to_state": null,
+      "payload": {
+        "abandoned": 0,
+        "nested": {
+          "b": [
+            1,
+            2,
+            {
+              "z": null,
+              "a": true
+            }
+          ],
+          "a": "x"
+        }
+      },
+      "expected_entry_hash": "08cf3ad91da37252143e4283400edb54ec5f716bc30c878b4d3d689441960258"
+    }
+  ]
+}
