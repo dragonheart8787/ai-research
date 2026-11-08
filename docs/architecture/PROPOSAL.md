@@ -7,6 +7,8 @@
 
 **Authentication amendment (2026-11-07, ADR-0011):** the system never uses provider API keys; `auth_mode` is `subscription_oauth` or `manual_handoff` only; the Q6 decision (dedicated API key) is **withdrawn**; adapters are disabled by default and Claude-driven ones need a human attestation that "usage credits" are OFF. **Scope note (ADR-0012):** real adapters appeared in M3, fixture-only.
 
+**Currency note (docs audit, 2026-11-08):** the credentials column of the §3 role table (API keys), the planned layout in §12, and the milestone table in §14 are superseded. For the current structure see `ARCHITECTURE.md`, for schemas `INTERFACES.md`, for the roadmap `ROADMAP.md`; M4 was split (ADR-0013), M4b and M5 are blocked (ADR-0014), and API keys are not used (ADR-0011).
+
 **M2 amendments (see `M2-NOTES.md`):** agents cannot cancel (human-only); reservation precedes `queued`; per-task limit = cap x attempts; permissions matrix is `src/airos/security/permissions.json`.
 
 **Amendments (2026-11-06, human review "approved with changes"):** see ADR-0009 (approval binding to task version + contract hash), the revised §5.3 anchoring, §7 operator-token authentication, §11.2 Q6 decision, §4.3 concurrency/Clock notes and §11.4 untrusted-input rule. Where this text and an ADR disagree, the newer ADR wins.

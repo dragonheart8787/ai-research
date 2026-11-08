@@ -1,5 +1,9 @@
 # M4b hand-off: what the human runs on the Ubuntu VM
 
+> **Status: not currently actionable.** M4b is blocked and deferred (ADR-0014). This procedure was written for M4a and is kept as a starting point only; the
+> reported M4b findings that came later are in `M4B-DESIGN-RECORD.md` (unverified), and parts of this file (for example the bind-mount layout) were reportedly
+> superseded. Do not follow it without re-checking.
+
 M4a was built in a cloud workspace with **no Docker daemon**. Everything that needs one is written but **unverified**. This file is the complete
 procedure to verify it. Nothing here needs a provider login or token: **do not log in to Claude or ChatGPT/Codex for these steps**, and do not put
 `CLAUDE_CODE_OAUTH_TOKEN` or any Codex login on the VM for them. Adapters stay disabled.

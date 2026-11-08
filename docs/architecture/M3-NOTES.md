@@ -1,5 +1,9 @@
 # M3 (integrations) notes, deviations, and what is / is not verified
 
+> **Historical.** Written before the subscription-only change (ADR-0011). References to an OpenAI/Anthropic HTTP Director/Planner, API keys, `UrllibTransport` and
+> per-role dollar budgets are superseded: those transports were deleted, auth is `subscription_oauth`/`manual_handoff`, and budgets are the `agent_sdk_credit`
+> pool (see `M4A-NOTES.md` and `ARCHITECTURE.md`).
+
 Scope delivered on `claude/m3-integrations` (after the nine M2 review fixes on `claude/m2-governance`). No network, no containers,
 no live credentials; the suite blocks sockets for every test.
 

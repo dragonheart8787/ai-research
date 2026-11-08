@@ -1,6 +1,6 @@
 # Architecture Decision Records
 
-Format: Status / Context / Decision / Consequences / Alternatives. Date of all initial ADRs: 2026-11-06. Status of all: **Proposed** (becomes *Accepted* when the human replies "approved"). Parent document: [`../architecture/PROPOSAL.md`](../architecture/PROPOSAL.md).
+Format: Status / Context / Decision / Consequences / Alternatives. The initial ADRs (0001-0010) are dated 2026-11-06; later ones carry their own date. Each file's own `Status:` line is authoritative (most early ones are still *Proposed*; 0009, 0012, 0013 and 0014 are *Accepted*; 0011 records a human directive but is still marked *Proposed*). Parent document: [`../architecture/PROPOSAL.md`](../architecture/PROPOSAL.md).
 
 | ADR | Decision |
 |---|---|
