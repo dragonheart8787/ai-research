@@ -11,7 +11,9 @@ import sys
 import tempfile
 from pathlib import Path
 
-from airos.agents.adapters import all_mock_adapters
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))   # the locked environment does not install the package itself
+
+from airos.agents.adapters import all_mock_adapters  # noqa: E402
 from airos.agents.registry import AgentRegistry, AgentSpec
 from airos.agents.runner import FreshDirRunner
 from airos.agents.worker import Worker
