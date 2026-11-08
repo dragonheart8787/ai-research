@@ -11,3 +11,6 @@ anchors/
 secrets/
 .env
 .env.*
+*.pem
+*.key
+tests/fixtures/recorded/
