@@ -59,3 +59,14 @@ openai/anthropic fixtures. **New:** `test_cli_adapters`, `test_auth_env_config`,
 2. Rootless vs `userns-remap` on the VM (this file assumes rootless).
 3. Are the assumed egress hosts acceptable as the starting list for the live check to confirm or correct?
 4. Directory ownership under rootless Docker: prefer a per-run `chmod`, a helper container, or Podman's `keep-id`? (decide after seeing the M4b result.)
+
+## Status table update (after the lost M4b Part 1; see M4B-DESIGN-RECORD.md and ADR-0014)
+Entries above for M1-M3 and M4a are unchanged. These items move or stay as follows:
+
+| Item | Status in this repository |
+|---|---|
+| Container isolation (flags honoured, rootless behaviour, limits, volumes) | **Not verified in this repository (historical results only).** Reported results from a lost session are in M4B-DESIGN-RECORD.md. |
+| Egress enforcement (allow-list proxy) | **Not verified in this repository (historical results only).** |
+| Check runner (container-backed) | **Not verified in this repository (historical results only).** |
+| Hostile workloads | **Not verified in this repository (historical results only).** |
+| Real CLI behaviour (flags, output shapes, credential-source field, usage-limit wording, login status) | **Not verified.** |

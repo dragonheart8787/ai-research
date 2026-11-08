@@ -17,3 +17,4 @@ Format: Status / Context / Decision / Consequences / Alternatives. Date of all i
 | [0011](0011-subscription-only-authentication.md) | Subscription-only authentication (no provider API keys) |
 | [0012](0012-real-adapters-appeared-in-m3-scope-deviation.md) | Scope deviation: real adapters appeared in M3 |
 | [0013](0013-m4a-sandbox-is-spec-only.md) | M4a sandbox is spec-only; isolation verified in M4b on the VM |
+| [0014](0014-m4b-sandbox-work-lost-deferral.md) | M4b sandbox work lost; deferral |
